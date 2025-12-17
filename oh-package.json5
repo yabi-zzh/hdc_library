@@ -1,0 +1,9 @@
+{
+  "name": "@anthropic/hdc-library",
+  "version": "1.0.0",
+  "description": "HDC Library for HarmonyOS",
+  "main": "./src/main/ets/Index.ets",
+  "author": "",
+  "license": "Apache-2.0",
+  "dependencies": {}
+}

@@ -1,0 +1,10 @@
+{
+  "module": {
+    "name": "hdc_library",
+    "type": "har",
+    "deviceTypes": [
+      "phone",
+      "tablet"
+    ]
+  }
+}

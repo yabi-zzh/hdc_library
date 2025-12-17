@@ -1,0 +1,19 @@
+# Build outputs
+build/
+.cxx/
+
+# IDE
+.idea/
+
+# DevEco Studio
+*.hap
+*.har
+local.properties
+oh_modules/
+
+# Node
+node_modules/
+
+# OS
+.DS_Store
+Thumbs.db

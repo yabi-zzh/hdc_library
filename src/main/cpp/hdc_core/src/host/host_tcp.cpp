@@ -1,0 +1,193 @@
+/*
+ * Copyright (C) 2021 Huawei Device Co., Ltd.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+#include "host_tcp.h"
+#include "server.h"
+
+namespace Hdc {
+HdcHostTCP::HdcHostTCP(const bool serverOrDaemonIn, void *ptrMainBase)
+    : HdcTCPBase(serverOrDaemonIn, ptrMainBase)
+{
+    broadcastFindWorking = false;
+}
+
+HdcHostTCP::~HdcHostTCP()
+{
+    WRITE_LOG(LOG_DEBUG, "~HdcHostTCP");
+}
+
+void HdcHostTCP::Stop()
+{
+}
+
+void HdcHostTCP::RecvUDPEntry(const sockaddr *addrSrc, uv_udp_t* /* handle */, const uv_buf_t *rcvbuf)
+{
+    char bufString[BUF_SIZE_TINY];
+    int port = 0;
+    char *p = strstr(rcvbuf->base, "-");
+    if (!p) {
+        return;
+    }
+    port = atoi(p + 1);
+    if (!port) {
+        return;
+    }
+    uv_ip6_name((sockaddr_in6 *)addrSrc, bufString, sizeof(bufString));
+    string addrPort = string(bufString);
+    addrPort += string(":") + std::to_string(port);
+    lstDaemonResult.push_back(addrPort);
+}
+
+void HdcHostTCP::BroadcastTimer(uv_idle_t *handle)
+{
+    uv_stop(handle->loop);
+}
+
+// Executive Administration Network Broadcast Discovery, broadcastLanIP==which interface to broadcast
+void HdcHostTCP::BroadcastFindDaemon(const char *broadcastLanIP)
+{
+    if (broadcastFindWorking) {
+        return;
+    }
+    broadcastFindWorking = true;
+    lstDaemonResult.clear();
+
+    uv_loop_t loopBroadcast;
+    LoopStatus loopBroadcastStatus(&loopBroadcast, "loopBroadcast");
+    uv_loop_init(&loopBroadcast);
+    loopBroadcastStatus.StartReportTimer();
+    struct sockaddr_in6 addr;
+    uv_udp_send_t req;
+    uv_udp_t client;
+    // send
+    uv_ip6_addr(broadcastLanIP, 0, &addr);
+    uv_udp_init(&loopBroadcast, &client);
+    uv_udp_bind(&client, (const struct sockaddr *)&addr, 0);
+    uv_udp_set_broadcast(&client, 1);
+    uv_ip6_addr("FFFF:FFFF:FFFF", DEFAULT_PORT, &addr);
+    uv_buf_t buf = uv_buf_init((char *)HANDSHAKE_MESSAGE.c_str(), HANDSHAKE_MESSAGE.size());
+    uv_udp_send(&req, &client, &buf, 1, (const struct sockaddr *)&addr, nullptr);
+    // recv
+    uv_udp_t server;
+    server.data = this;
+    uv_ip6_addr(broadcastLanIP, DEFAULT_PORT, &addr);
+    uv_udp_init(&loopBroadcast, &server);
+    uv_udp_bind(&server, (const struct sockaddr *)&addr, UV_UDP_REUSEADDR);
+    uv_udp_recv_start(&server, AllocStreamUDP, RecvUDP);
+    // find timeout
+    uv_timer_t tLastCheck;
+    uv_timer_init(&loopBroadcast, &tLastCheck);
+    uv_timer_start(&tLastCheck, (uv_timer_cb)BroadcastTimer, TIME_BASE, 0);  // timeout debug 1s
+
+    uv_run(&loopBroadcast, UV_RUN_DEFAULT);
+    uv_loop_close(&loopBroadcast);
+    broadcastFindWorking = false;
+}
+
+void HdcHostTCP::Connect(uv_connect_t *connection, int status)
+{
+    HSession hSession = (HSession)connection->data;
+    delete connection;
+    HdcSessionBase *ptrConnect = (HdcSessionBase *)hSession->classInstance;
+    auto ctrl = ptrConnect->BuildCtrlString(SP_START_SESSION, 0, nullptr, 0);
+    if (status < 0) {
+        WRITE_LOG(LOG_FATAL, "Connect status:%d", status);
+        hSession->isRunningOk = false;
+        char buffer[BUF_SIZE_DEFAULT] = { 0 };
+        uv_strerror_r(status, buffer, BUF_SIZE_DEFAULT);
+        hSession->faultInfo += buffer;        
+        goto Finish;
+    }
+    if ((hSession->fdChildWorkTCP = Base::DuplicateUvSocket(&hSession->hWorkTCP)) < 0) {
+        WRITE_LOG(LOG_FATAL, "Connect fdChildWorkTCP:%d", hSession->fdChildWorkTCP);
+        goto Finish;
+    }
+    uv_read_stop((uv_stream_t *)&hSession->hWorkTCP);
+    Base::SetTcpOptions((uv_tcp_t *)&hSession->hWorkTCP);
+    WRITE_LOG(LOG_INFO, "HdcHostTCP::Connect start session work thread, sid:%u", hSession->sessionId);
+    Base::StartWorkThread(&ptrConnect->loopMain, ptrConnect->SessionWorkThread, Base::FinishWorkThread, hSession);
+    // wait for thread up
+    while (hSession->childLoop.active_handles == 0) {
+        uv_sleep(MINOR_TIMEOUT);
+    }
+    Base::SendToPollFd(hSession->ctrlFd[STREAM_MAIN], ctrl.data(), ctrl.size());
+    return;
+Finish:
+    WRITE_LOG(LOG_FATAL, "Connect failed sessionId:%u", hSession->sessionId);
+    hSession->childCleared = true;
+    ptrConnect->FreeSession(hSession->sessionId);
+}
+
+HSession HdcHostTCP::ConnectDaemon(const string &connectKey, bool isCheck)
+{
+    char ip[BUF_SIZE_TINY] = "";
+    uint16_t port = 0;
+    if (Base::ConnectKey2IPPort(connectKey.c_str(), ip, &port, sizeof(ip)) < 0) {
+        WRITE_LOG(LOG_FATAL, "ConnectKey2IPPort error connectKey:%s", Hdc::MaskString(connectKey).c_str());
+        return nullptr;
+    }
+
+    HdcSessionBase *ptrConnect = (HdcSessionBase *)clsMainBase;
+    HSession hSession = ptrConnect->MallocSession(true, CONN_TCP, this);
+    if (!hSession) {
+        WRITE_LOG(LOG_FATAL, "hSession nullptr connectKey:%s", Hdc::MaskString(connectKey).c_str());
+        return nullptr;
+    }
+    hSession->isCheck = isCheck;
+    hSession->connectKey = connectKey;
+    ptrConnect->PrintAllSessionConnection(hSession->sessionId);
+    struct sockaddr_in dest;
+    uv_ip4_addr(ip, port, &dest);
+    uv_connect_t *conn = new(std::nothrow) uv_connect_t();
+    if (conn == nullptr) {
+        WRITE_LOG(LOG_FATAL, "ConnectDaemon new conn failed");
+        delete hSession;
+        hSession = nullptr;
+        return nullptr;
+    }
+    conn->data = hSession;
+    WRITE_LOG(LOG_INFO, "start tcp connect, connectKey:%s sid:%u", Hdc::MaskString(connectKey).c_str(),
+        hSession->sessionId);
+    uv_tcp_connect(conn, (uv_tcp_t *)&hSession->hWorkTCP, (const struct sockaddr *)&dest, Connect);
+    return hSession;
+}
+
+void HdcHostTCP::FindLanDaemon()
+{
+    uv_interface_address_t *info;
+    int count;
+    int i;
+    int ret;
+    char ipAddr[BUF_SIZE_TINY] = "";
+    if (broadcastFindWorking) {
+        return;
+    }
+    lstDaemonResult.clear();
+    ret = uv_interface_addresses(&info, &count);
+    if (ret != 0 || count <= 0) {
+        WRITE_LOG(LOG_FATAL, "uv_interface_addresses failed %d, count is %d", ret, count);
+        return;
+    }
+    i = count;
+    while (--i) {
+        uv_interface_address_t interface = info[i];
+        if (interface.address.address6.sin6_family == AF_INET6) {
+            continue;
+        }
+        uv_ip6_name(&interface.address.address6, ipAddr, sizeof(ipAddr));
+        BroadcastFindDaemon(ipAddr);
+    }
+    uv_free_interface_addresses(info, count);
+}
+}  // namespace Hdc
