@@ -19,22 +19,22 @@ export class HdcErrorCode {
   // 协议错误 (-2001 ~ -2003)
   static readonly ERR_PROTOCOL_ERROR: number = -2001;
   static readonly ERR_INVALID_COMMAND: number = -2002;
-  static readonly ERR_INVALID_PARAMETER: number = -2003;
+  static readonly ERR_INVALID_RESPONSE: number = -2003;
 
   // 文件传输错误 (-3001 ~ -3003)
   static readonly ERR_FILE_NOT_FOUND: number = -3001;
   static readonly ERR_PERMISSION_DENIED: number = -3002;
-  static readonly ERR_TRANSFER_FAILED: number = -3003;
+  static readonly ERR_FILE_TRANSFER_FAILED: number = -3003;
 
   // 设备错误 (-4001 ~ -4003)
   static readonly ERR_DEVICE_NOT_FOUND: number = -4001;
   static readonly ERR_DEVICE_OFFLINE: number = -4002;
-  static readonly ERR_MULTIPLE_DEVICES: number = -4003;
+  static readonly ERR_DEVICE_BUSY: number = -4003;
 
   // 应用管理错误 (-5001 ~ -5003)
   static readonly ERR_INSTALL_FAILED: number = -5001;
   static readonly ERR_UNINSTALL_FAILED: number = -5002;
-  static readonly ERR_INVALID_PACKAGE: number = -5003;
+  static readonly ERR_APP_NOT_FOUND: number = -5003;
 
   // 端口转发错误 (-6001 ~ -6002)
   static readonly ERR_PORT_IN_USE: number = -6001;
@@ -87,22 +87,22 @@ class ErrorMessageMap {
     // 协议错误
     this.messages.set(HdcErrorCode.ERR_PROTOCOL_ERROR, '协议错误');
     this.messages.set(HdcErrorCode.ERR_INVALID_COMMAND, '无效的命令');
-    this.messages.set(HdcErrorCode.ERR_INVALID_PARAMETER, '参数无效');
+    this.messages.set(HdcErrorCode.ERR_INVALID_RESPONSE, '无效的响应');
 
     // 文件传输错误
     this.messages.set(HdcErrorCode.ERR_FILE_NOT_FOUND, '文件不存在');
     this.messages.set(HdcErrorCode.ERR_PERMISSION_DENIED, '权限被拒绝');
-    this.messages.set(HdcErrorCode.ERR_TRANSFER_FAILED, '传输失败');
+    this.messages.set(HdcErrorCode.ERR_FILE_TRANSFER_FAILED, '文件传输失败');
 
     // 设备错误
     this.messages.set(HdcErrorCode.ERR_DEVICE_NOT_FOUND, '设备未找到');
     this.messages.set(HdcErrorCode.ERR_DEVICE_OFFLINE, '设备离线');
-    this.messages.set(HdcErrorCode.ERR_MULTIPLE_DEVICES, '存在多个设备，请指定连接标识');
+    this.messages.set(HdcErrorCode.ERR_DEVICE_BUSY, '设备忙');
 
     // 应用管理错误
     this.messages.set(HdcErrorCode.ERR_INSTALL_FAILED, '安装失败');
     this.messages.set(HdcErrorCode.ERR_UNINSTALL_FAILED, '卸载失败');
-    this.messages.set(HdcErrorCode.ERR_INVALID_PACKAGE, '无效安装包');
+    this.messages.set(HdcErrorCode.ERR_APP_NOT_FOUND, '应用未找到');
 
     // 端口转发错误
     this.messages.set(HdcErrorCode.ERR_PORT_IN_USE, '端口已被占用');
@@ -150,16 +150,16 @@ export function getAllErrorCodes(): number[] {
     HdcErrorCode.ERR_HANDSHAKE_FAILED,
     HdcErrorCode.ERR_PROTOCOL_ERROR,
     HdcErrorCode.ERR_INVALID_COMMAND,
-    HdcErrorCode.ERR_INVALID_PARAMETER,
+    HdcErrorCode.ERR_INVALID_RESPONSE,
     HdcErrorCode.ERR_FILE_NOT_FOUND,
     HdcErrorCode.ERR_PERMISSION_DENIED,
-    HdcErrorCode.ERR_TRANSFER_FAILED,
+    HdcErrorCode.ERR_FILE_TRANSFER_FAILED,
     HdcErrorCode.ERR_DEVICE_NOT_FOUND,
     HdcErrorCode.ERR_DEVICE_OFFLINE,
-    HdcErrorCode.ERR_MULTIPLE_DEVICES,
+    HdcErrorCode.ERR_DEVICE_BUSY,
     HdcErrorCode.ERR_INSTALL_FAILED,
     HdcErrorCode.ERR_UNINSTALL_FAILED,
-    HdcErrorCode.ERR_INVALID_PACKAGE,
+    HdcErrorCode.ERR_APP_NOT_FOUND,
     HdcErrorCode.ERR_PORT_IN_USE,
     HdcErrorCode.ERR_FORWARD_FAILED,
     HdcErrorCode.ERR_AUTH_FAILED,

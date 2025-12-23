@@ -87,11 +87,6 @@ class NapiCheckDeviceResult {
   status: string = '';
 }
 
-class NapiJpidResult {
-  count: number = 0;
-  data: string = '';
-}
-
 class NapiDiscoverItem {
   connectKey: string = '';
 }
@@ -106,9 +101,9 @@ export class HdcClient {
 
   /**
    * 初始化 HDC 客户端
-   * @param logLevel 日志级别 (0-4)
-   * @param sandboxPath 沙箱路径
-   * @returns 错误码
+   * @param logLevel 日志级别 (0-4)，默认为 3
+   * @param sandboxPath 应用沙箱路径，用于存储 RSA 密钥
+   * @returns 错误码，0 表示成功
    */
   static init(logLevel: number = 3, sandboxPath: string = ''): number {
     if (HdcClient.initialized) {
@@ -133,9 +128,14 @@ export class HdcClient {
 
   /**
    * 检查是否已初始化
+   * @returns 是否已初始化
    */
   static isInitialized(): boolean {
-    return HdcClient.initialized;
+    // 同时检查本地状态和 NAPI 层状态
+    const napiInitialized = hdcNapi.hdcIsInitialized() as boolean;
+    // 同步状态
+    HdcClient.initialized = napiInitialized;
+    return napiInitialized;
   }
 
   // ==================== 连接管理 ====================
@@ -158,7 +158,7 @@ export class HdcClient {
   /**
    * 断开连接
    * @param connId 连接标识（可选）
-   * @returns 错误码
+   * @returns 错误码，0 表示成功
    */
   static disconnect(connId?: string): number {
     return hdcNapi.hdcDisconnect(connId) as number;
@@ -202,8 +202,8 @@ export class HdcClient {
    * 等待设备连接
    * @param host 主机地址
    * @param port 端口号
-   * @param timeoutMs 超时时间（毫秒）
-   * @returns 错误码
+   * @param timeoutMs 超时时间（毫秒），默认 30000
+   * @returns 错误码，0 表示成功
    */
   static waitForDevice(host: string, port: number, timeoutMs: number = 30000): number {
     if (!HdcClient.initialized) {
@@ -243,6 +243,26 @@ export class HdcClient {
    */
   static shell(command: string, connId?: string): ShellResult {
     const result = hdcNapi.hdcShell(command, connId) as NapiShellResult;
+    if (result.code === HdcErrorCode.SUCCESS) {
+      return new ShellResult(true, result.output);
+    }
+    return new ShellResult(false, result.output, result.code, HdcClient.getErrorMessage(result.code));
+  }
+
+  /**
+   * 通用 hdc 命令执行接口
+   * 支持执行任意 hdc 命令，如: "shell ls -la", "fport ls", "target mount" 等
+   * @param command 完整的 hdc 命令字符串（不需要 "hdc" 前缀）
+   * @returns ShellResult
+   * @example
+   * HdcClient.execute("shell ls -la /data")
+   * HdcClient.execute("fport ls")
+   * HdcClient.execute("fport tcp:8080 tcp:8080")
+   * HdcClient.execute("target mount")
+   * HdcClient.execute("hilog")
+   */
+  static execute(command: string): ShellResult {
+    const result = hdcNapi.hdcExecute(command) as NapiShellResult;
     if (result.code === HdcErrorCode.SUCCESS) {
       return new ShellResult(true, result.output);
     }
@@ -313,7 +333,7 @@ export class HdcClient {
    * @param localPath 本地文件路径
    * @param remotePath 远程文件路径
    * @param connId 连接标识（可选）
-   * @returns 错误码
+   * @returns 错误码，0 表示成功
    */
   static fileSend(localPath: string, remotePath: string, connId?: string): number {
     return hdcNapi.hdcFileSend(localPath, remotePath, connId) as number;
@@ -324,7 +344,7 @@ export class HdcClient {
    * @param remotePath 远程文件路径
    * @param localPath 本地文件路径
    * @param connId 连接标识（可选）
-   * @returns 错误码
+   * @returns 错误码，0 表示成功
    */
   static fileRecv(remotePath: string, localPath: string, connId?: string): number {
     return hdcNapi.hdcFileRecv(remotePath, localPath, connId) as number;
@@ -380,24 +400,48 @@ export class HdcClient {
 
   /**
    * 设置端口转发
-   * @param localPort 本地端口
-   * @param remotePort 远程端口
+   * @param localPort 本地端口，格式如 "tcp:8080" 或 "8080"
+   * @param remotePort 远程端口，格式如 "tcp:8080" 或 "8080"
    * @param connId 连接标识（可选）
-   * @returns 错误码
+   * @returns 错误码，0 表示成功
    */
   static forward(localPort: string, remotePort: string, connId?: string): number {
     return hdcNapi.hdcForward(localPort, remotePort, connId) as number;
   }
 
   /**
-   * 设置反向端口转发
-   * @param remotePort 远程端口
-   * @param localPort 本地端口
+   * 设置反向端口转发（注意：当前版本未实现）
+   * @param remotePort 远程端口，格式如 "tcp:8080" 或 "8080"
+   * @param localPort 本地端口，格式如 "tcp:8080" 或 "8080"
    * @param connId 连接标识（可选）
-   * @returns 错误码
+   * @returns 错误码，0 表示成功
    */
   static reverse(remotePort: string, localPort: string, connId?: string): number {
     return hdcNapi.hdcReverse(remotePort, localPort, connId) as number;
+  }
+
+  /**
+   * 列出所有端口转发任务 (fport ls)
+   * @param connId 连接标识（可选）
+   * @returns ShellResult
+   */
+  static forwardList(connId?: string): ShellResult {
+    const result = hdcNapi.hdcForwardList(connId) as NapiShellResult;
+    if (result.code === HdcErrorCode.SUCCESS) {
+      return new ShellResult(true, result.output);
+    }
+    return new ShellResult(false, result.output, result.code, HdcClient.getErrorMessage(result.code));
+  }
+
+  /**
+   * 删除端口转发任务 (fport rm)
+   * @param localPort 本地端口
+   * @param remotePort 远程端口
+   * @param connId 连接标识（可选）
+   * @returns 错误码，0 表示成功
+   */
+  static forwardRemove(localPort: string, remotePort: string, connId?: string): number {
+    return hdcNapi.hdcForwardRemove(localPort, remotePort, connId) as number;
   }
 
   // ==================== 日志和调试 ====================
@@ -446,9 +490,9 @@ export class HdcClient {
   // ==================== 密钥管理 ====================
 
   /**
-   * 生成密钥
+   * 生成密钥（注意：当前版本功能未完全实现）
    * @param outputPath 输出路径
-   * @returns 错误码
+   * @returns 错误码，0 表示成功
    */
   static keygen(outputPath: string): number {
     return hdcNapi.hdcKeygen(outputPath) as number;

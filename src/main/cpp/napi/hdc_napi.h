@@ -30,6 +30,7 @@ napi_value HdcDiscover(napi_env env, napi_callback_info info);
 
 // Command execution
 napi_value HdcShell(napi_env env, napi_callback_info info);
+napi_value HdcExecute(napi_env env, napi_callback_info info);
 napi_value HdcTargetBoot(napi_env env, napi_callback_info info);
 napi_value HdcTargetMount(napi_env env, napi_callback_info info);
 napi_value HdcSmode(napi_env env, napi_callback_info info);
@@ -47,6 +48,8 @@ napi_value HdcSideload(napi_env env, napi_callback_info info);
 // Port forwarding
 napi_value HdcForward(napi_env env, napi_callback_info info);
 napi_value HdcReverse(napi_env env, napi_callback_info info);
+napi_value HdcForwardList(napi_env env, napi_callback_info info);
+napi_value HdcForwardRemove(napi_env env, napi_callback_info info);
 
 // Logging and debug
 napi_value HdcHilog(napi_env env, napi_callback_info info);

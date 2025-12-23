@@ -405,6 +405,23 @@ napi_value HdcShell(napi_env env, napi_callback_info info) {
 }
 
 /**
+ * HdcExecute - 通用 hdc 命令执行接口
+ * 支持执行任意 hdc 命令，如: shell ls, fport ls, target mount 等
+ */
+napi_value HdcExecute(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value args[1];
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    
+    std::string command;
+    if (argc > 0) GetStringArg(env, args[0], command);
+    
+    OH_LOG_INFO(LOG_APP, "HdcExecute: %{public}s", command.c_str());
+    auto result = HdcClientWrapper::GetInstance().Execute(command);
+    return CreateCommandResult(env, result.code, result.output);
+}
+
+/**
  * HdcTargetBoot - Reboot device
  */
 napi_value HdcTargetBoot(napi_env env, napi_callback_info info) {
@@ -591,6 +608,38 @@ napi_value HdcReverse(napi_env env, napi_callback_info info) {
 }
 
 /**
+ * HdcForwardList - List all port forwards (fport ls)
+ */
+napi_value HdcForwardList(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value args[1];
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    
+    std::string connId;
+    if (argc > 0) GetStringArg(env, args[0], connId);
+    
+    auto result = HdcClientWrapper::GetInstance().ForwardList(connId);
+    return CreateCommandResult(env, result.code, result.output);
+}
+
+/**
+ * HdcForwardRemove - Remove port forward (fport rm)
+ */
+napi_value HdcForwardRemove(napi_env env, napi_callback_info info) {
+    size_t argc = 3;
+    napi_value args[3];
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    
+    std::string localPort, remotePort, connId;
+    if (argc > 0) GetStringArg(env, args[0], localPort);
+    if (argc > 1) GetStringArg(env, args[1], remotePort);
+    if (argc > 2) GetStringArg(env, args[2], connId);
+    
+    int result = HdcClientWrapper::GetInstance().ForwardRemove(localPort, remotePort, connId);
+    return CreateInt32Result(env, result);
+}
+
+/**
  * HdcHilog - Get device hilog
  */
 napi_value HdcHilog(napi_env env, napi_callback_info info) {
@@ -711,6 +760,7 @@ napi_value Init(napi_env env, napi_value exports) {
         {"hdcDiscover", nullptr, HdcDiscover, nullptr, nullptr, nullptr, napi_default, nullptr},
         // Command execution
         {"hdcShell", nullptr, HdcShell, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"hdcExecute", nullptr, HdcExecute, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"hdcTargetBoot", nullptr, HdcTargetBoot, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"hdcTargetMount", nullptr, HdcTargetMount, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"hdcSmode", nullptr, HdcSmode, nullptr, nullptr, nullptr, napi_default, nullptr},
@@ -725,6 +775,8 @@ napi_value Init(napi_env env, napi_value exports) {
         // Port forwarding
         {"hdcForward", nullptr, HdcForward, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"hdcReverse", nullptr, HdcReverse, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"hdcForwardList", nullptr, HdcForwardList, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"hdcForwardRemove", nullptr, HdcForwardRemove, nullptr, nullptr, nullptr, napi_default, nullptr},
         // Logging and debug
         {"hdcHilog", nullptr, HdcHilog, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"hdcBugreport", nullptr, HdcBugreport, nullptr, nullptr, nullptr, napi_default, nullptr},

@@ -19,6 +19,8 @@
 #include <lz4.h>
 #include <map>
 #include <atomic>
+#include <algorithm>
+#include <vector>
 
 // Include HDC core headers for proper protocol handling
 #include "session.h"
@@ -87,6 +89,7 @@ enum HdcCommand {
     CMD_KERNEL_CHANNEL_CLOSE = 2,
     CMD_KERNEL_ECHO = 9,
     CMD_KERNEL_ECHO_RAW = 10,  // Raw output from CMD_UNITY_EXECUTE
+    CMD_KERNEL_WAKEUP_SLAVETASK = 12,  // Daemon wakeup slave task
     CMD_UNITY_EXECUTE = 1001,
     CMD_UNITY_REMOUNT = 1002,
     CMD_UNITY_REBOOT = 1003,
@@ -96,7 +99,17 @@ enum HdcCommand {
     CMD_UNITY_BUGREPORT_INIT = 1011,
     CMD_SHELL_INIT = 2000,
     CMD_SHELL_DATA = 2001,
+    // Forward commands
     CMD_FORWARD_INIT = 2500,
+    CMD_FORWARD_CHECK = 2501,
+    CMD_FORWARD_CHECK_RESULT = 2502,
+    CMD_FORWARD_ACTIVE_SLAVE = 2503,
+    CMD_FORWARD_ACTIVE_MASTER = 2504,
+    CMD_FORWARD_DATA = 2505,
+    CMD_FORWARD_FREE_CONTEXT = 2506,
+    CMD_FORWARD_LIST = 2507,
+    CMD_FORWARD_REMOVE = 2508,
+    CMD_FORWARD_SUCCESS = 2509,
     // File transfer commands
     CMD_FILE_INIT = 3000,
     CMD_FILE_CHECK = 3001,
@@ -203,20 +216,73 @@ struct ConnectionState {
 // Global connection state
 static ConnectionState* g_connState = nullptr;
 
+// Forward context structure for managing port forwarding
+struct ForwardContext {
+    uint32_t id;                    // Context ID
+    uint32_t channelId;             // HDC channel ID
+    bool masterSlave;               // true = master (listener), false = slave (connector)
+    bool ready;                     // Forward is ready for data transfer
+    bool finished;                  // Context is finished/closed
+    bool checkPoint;                // Is this a check point connection
+    std::string localSpec;          // Local port spec (e.g., "tcp:8080")
+    std::string remoteSpec;         // Remote port spec (e.g., "tcp:8012")
+    int localPort;                  // Parsed local port number
+    int remotePort;                 // Parsed remote port number
+    uv_tcp_t tcpHandle;             // TCP handle for local connection
+    uv_tcp_t listenHandle;          // TCP handle for listening (master only)
+    std::string dataBuffer;         // Buffer for incoming data
+    std::mutex mutex;
+};
+
+// Forward task structure for managing a forward session
+struct ForwardTask {
+    uint32_t channelId;             // HDC channel ID for this forward
+    std::string localSpec;          // Local port spec
+    std::string remoteSpec;         // Remote port spec
+    int localPort;                  // Local port number
+    bool isReverse;                 // Is this a reverse forward
+    bool established;               // Forward is established
+    bool failed;                    // Forward setup failed
+    std::string errorMessage;       // Error message if failed
+    std::map<uint32_t, ForwardContext*> contexts;  // Active contexts
+    std::mutex mutex;
+    std::condition_variable cv;
+    uv_tcp_t listenHandle;          // TCP listener handle
+    bool listenerActive;            // Listener is active
+};
+
+// Global forward task map
+static std::map<uint32_t, ForwardTask*> g_forwardTasks;
+static std::mutex g_forwardTasksMutex;
+
+// Forward info for listing
+struct ForwardInfo {
+    std::string localSpec;
+    std::string remoteSpec;
+    bool isReverse;
+    uint32_t channelId;
+};
+
+// Local forward list
+static std::vector<ForwardInfo> g_forwardList;
+static std::mutex g_forwardListMutex;
+
+// Forward protocol constants
+static const int FORWARD_PARAM_BUF_SIZE = 8;  // First 8 bytes for parameter bits
+static const uint32_t DWORD_SERIALIZE_SIZE = 4;  // Size of uint32_t for context ID
+
 // Static mutex for event loop thread safety
 static std::mutex g_loopMutex;
 // Flag to indicate if we should keep the event loop running (for the lifetime of the app)
 static std::atomic<bool> g_keepLoopAlive{true};
 
 HdcClientWrapper::HdcClientWrapper() {
-    OH_LOG_INFO(LOG_APP, "HdcClientWrapper created");
 }
 
 HdcClientWrapper::~HdcClientWrapper() {
     if (initialized_) {
         Cleanup();
     }
-    OH_LOG_INFO(LOG_APP, "HdcClientWrapper destroyed");
 }
 
 HdcClientWrapper& HdcClientWrapper::GetInstance() {
@@ -228,29 +294,19 @@ int HdcClientWrapper::Init(int logLevel, const std::string& sandboxPath) {
     std::lock_guard<std::mutex> lock(mutex_);
     
     if (initialized_) {
-        OH_LOG_INFO(LOG_APP, "HdcClientWrapper already initialized");
         return static_cast<int>(ErrorCode::SUCCESS);
     }
     
-    OH_LOG_INFO(LOG_APP, "Initializing HdcClientWrapper with log level %{public}d", logLevel);
-    
-    // 设置应用沙箱路径（用于存�?RSA 密钥�?
+    // 设置应用沙箱路径（用于存储 RSA 密钥）
     if (!sandboxPath.empty()) {
-        OH_LOG_INFO(LOG_APP, "Setting sandbox path: %{public}s", sandboxPath.c_str());
         HdcAuth::SetAppSandboxPath(sandboxPath);
     }
     
-    // Pre-generate RSA key pair if not exists (this can take 2-3 seconds)
-    // Do it during init to avoid delay during first connection
-    OH_LOG_INFO(LOG_APP, "Checking/generating RSA key pair...");
+    // Pre-generate RSA key pair if not exists
     std::string pubkeyInfo;
-    if (HdcAuth::GetPublicKeyinfo(pubkeyInfo)) {
-        OH_LOG_INFO(LOG_APP, "RSA key pair ready");
-    } else {
-        OH_LOG_WARN(LOG_APP, "Failed to prepare RSA key pair, will retry during connection");
-    }
+    HdcAuth::GetPublicKeyinfo(pubkeyInfo);
     
-    // Reset the keep-alive flag (may have been set to false by previous Cleanup)
+    // Reset the keep-alive flag
     g_keepLoopAlive = true;
     
     // Create libuv event loop
@@ -267,47 +323,53 @@ int HdcClientWrapper::Init(int logLevel, const std::string& sandboxPath) {
     initialized_ = true;
     lastError_ = static_cast<int>(ErrorCode::SUCCESS);
     
-    OH_LOG_INFO(LOG_APP, "HdcClientWrapper initialized successfully");
+    OH_LOG_INFO(LOG_APP, "HdcClientWrapper initialized");
     return static_cast<int>(ErrorCode::SUCCESS);
 }
+
+// Forward declaration for cleanup helper
+static void CleanupForwardTasks();
 
 void HdcClientWrapper::Cleanup() {
     std::lock_guard<std::mutex> lock(mutex_);
     
     if (!initialized_) {
-        OH_LOG_INFO(LOG_APP, "HdcClientWrapper not initialized, skip cleanup");
         return;
     }
     
-    OH_LOG_INFO(LOG_APP, "Cleaning up HdcClientWrapper");
+    // First stop the event loop to prevent any further processing
+    StopEventLoop();
     
-    // Disconnect if connected - clear global pointer first
+    // Now safe to cleanup connection state
     ConnectionState* oldState = g_connState;
     g_connState = nullptr;
     
     if (oldState != nullptr) {
-        if (oldState->connected.load() && !uv_is_closing((uv_handle_t*)&oldState->tcpHandle)) {
-            uv_read_stop((uv_stream_t*)&oldState->tcpHandle);
-            uv_close((uv_handle_t*)&oldState->tcpHandle, nullptr);
-        }
         delete oldState;
     }
     
-    // Stop event loop if running
-    StopEventLoop();
+    // Cleanup forward tasks and list
+    CleanupForwardTasks();
     
     // Close and cleanup libuv loop
     if (loop_ != nullptr) {
+        // Walk all handles and close them
+        uv_walk(loop_, [](uv_handle_t* handle, void* arg) {
+            if (!uv_is_closing(handle)) {
+                uv_close(handle, nullptr);
+            }
+        }, nullptr);
+        
+        // Run loop once more to process close callbacks
+        uv_run(loop_, UV_RUN_NOWAIT);
+        
         uv_loop_close(loop_);
         delete loop_;
         loop_ = nullptr;
     }
     
-    // Clear connection info
     currentConnectKey_.clear();
-    
     initialized_ = false;
-    OH_LOG_INFO(LOG_APP, "HdcClientWrapper cleanup completed");
 }
 
 bool HdcClientWrapper::IsInitialized() const {
@@ -334,75 +396,51 @@ void HdcClientWrapper::RunEventLoop() {
     {
         std::lock_guard<std::mutex> lock(g_loopMutex);
         if (loop_ == nullptr) {
-            OH_LOG_WARN(LOG_APP, "RunEventLoop: loop_ is null");
             return;
         }
-        // Use compare_exchange to atomically check and set loopRunning_
         bool expected = false;
         if (!loopRunning_.compare_exchange_strong(expected, true)) {
-            OH_LOG_INFO(LOG_APP, "RunEventLoop: loop already running");
             return;
         }
     }
     
-    OH_LOG_INFO(LOG_APP, "RunEventLoop: starting event loop");
-    
-    // Run the event loop continuously - it will handle multiple connections
-    // The loop only exits when the app is being destroyed (g_keepLoopAlive = false)
     while (g_keepLoopAlive && loopRunning_) {
-        uv_loop_t* currentLoop = nullptr;
-        
-        // Get current loop pointer under lock
         {
             std::lock_guard<std::mutex> lock(g_loopMutex);
-            currentLoop = loop_;
-            if (currentLoop == nullptr) {
-                OH_LOG_INFO(LOG_APP, "RunEventLoop: loop is null, exiting");
+            
+            if (loop_ == nullptr) {
                 break;
             }
+            
+            uv_run(loop_, UV_RUN_NOWAIT);
         }
         
-        // Use UV_RUN_ONCE to wait for and process one event
-        // This is more efficient than UV_RUN_NOWAIT + sleep
-        // UV_RUN_ONCE will block until there's an event to process or the loop is stopped
-        int result = uv_run(currentLoop, UV_RUN_ONCE);
-        
-        // result == 0 means no more active handles/requests
-        // In this case, sleep briefly to avoid busy loop when idle
-        if (result == 0) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
     
     loopRunning_ = false;
-    OH_LOG_INFO(LOG_APP, "RunEventLoop: event loop stopped");
 }
 
 void HdcClientWrapper::StopEventLoop() {
-    OH_LOG_INFO(LOG_APP, "StopEventLoop: requesting stop (for app cleanup)");
-    
-    // Signal the loop to stop permanently
+    // Signal the loop to stop
     g_keepLoopAlive = false;
-    loopRunning_ = false;
     
     {
         std::lock_guard<std::mutex> lock(g_loopMutex);
-        
-        if (loop_ == nullptr) {
-            return;
+        if (loop_ != nullptr) {
+            uv_stop(loop_);
         }
-        
-        OH_LOG_INFO(LOG_APP, "StopEventLoop: stopping event loop");
-        
-        // Stop the loop - this will cause uv_run to return
-        uv_stop(loop_);
     }
     
-    // Wait for loop thread to exit
+    // Wait for loop thread to exit (max 2 seconds)
     int waitCount = 0;
-    while (loopRunning_ && waitCount < 100) {
+    while (loopRunning_ && waitCount < 200) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
         waitCount++;
+    }
+    
+    if (loopRunning_) {
+        OH_LOG_WARN(LOG_APP, "StopEventLoop: timeout waiting for loop to stop");
     }
 }
 
@@ -462,6 +500,26 @@ static bool ProcessFileData(const uint8_t* data, size_t dataSize);
 static void SendHandshakeResponse(ConnectionState* state, uint32_t sessionId);
 static bool SendHdcPacket(ConnectionState* state, uint32_t channelId, uint16_t commandFlag, 
                           const uint8_t* data, size_t dataSize);
+
+// Forward protocol functions
+static bool SendForwardPacket(uint32_t contextId, uint16_t command, const uint8_t* data, size_t dataSize);
+static void HandleForwardCheck(uint32_t channelId, const uint8_t* payload, size_t payloadSize);
+static void HandleForwardCheckResult(uint32_t channelId, const uint8_t* payload, size_t payloadSize);
+static void HandleForwardActiveMaster(uint32_t channelId, const uint8_t* payload, size_t payloadSize);
+static void HandleForwardActiveSlave(uint32_t channelId, const uint8_t* payload, size_t payloadSize);
+static void HandleForwardData(uint32_t channelId, const uint8_t* payload, size_t payloadSize);
+static void HandleForwardFreeContext(uint32_t channelId, const uint8_t* payload, size_t payloadSize);
+static void HandleForwardSuccess(uint32_t channelId, const uint8_t* payload, size_t payloadSize);
+static ForwardTask* GetForwardTask(uint32_t channelId);
+static ForwardContext* GetForwardContext(ForwardTask* task, uint32_t contextId);
+static uint32_t GenerateContextId();
+static bool ParsePortSpec(const std::string& spec, std::string& type, int& port);
+static void ForwardListenCallback(uv_stream_t* server, int status);
+static void ForwardConnectCallback(uv_connect_t* req, int status);
+static void ForwardReadCallback(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf);
+static void ForwardAllocCallback(uv_handle_t* handle, size_t suggested_size, uv_buf_t* buf);
+static void ProcessForwardMessage(uint16_t command, uint32_t channelId, 
+                                  const uint8_t* payload, size_t payloadSize);
 
 static void OnRead(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
     // Safety check: verify stream->data is a valid ConnectionState
@@ -531,8 +589,8 @@ static void OnRead(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
             std::string protectStr(state->responseBuffer.data() + sizeof(PayloadHead), headSize);
             Hdc::SerialStruct::ParseFromString(protectBuf, protectStr);
             
-            OH_LOG_INFO(LOG_APP, "Packet cmd=%{public}u, channelId=%{public}u, vCode=0x%{public}02x", 
-                        protectBuf.commandFlag, protectBuf.channelId, protectBuf.vCode);
+            OH_LOG_INFO(LOG_APP, "Packet cmd=%{public}u, channelId=%{public}u", 
+                        protectBuf.commandFlag, protectBuf.channelId);
             
             // Verify vCode
             if (protectBuf.vCode != PAYLOAD_VCODE) {
@@ -550,15 +608,13 @@ static void OnRead(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
             
             // Handle CMD_KERNEL_HANDSHAKE
             if (protectBuf.commandFlag == CMD_KERNEL_HANDSHAKE) {
-                OH_LOG_INFO(LOG_APP, "Received handshake packet, payloadSize=%{public}zu", payloadSize);
-                
                 // Parse SessionHandShake using TLV deserialization
                 Hdc::HdcSessionBase::SessionHandShake handshake = {};
                 std::string handshakeStr(reinterpret_cast<const char*>(payloadData), payloadSize);
                 Hdc::SerialStruct::ParseFromString(handshake, handshakeStr);
                 
-                OH_LOG_INFO(LOG_APP, "Daemon handshake: banner=%{public}s, authType=%{public}u, sessionId=%{public}u, version=%{public}s",
-                            handshake.banner.c_str(), handshake.authType, handshake.sessionId, handshake.version.c_str());
+                OH_LOG_INFO(LOG_APP, "Handshake: authType=%{public}u, sessionId=%{public}u",
+                            handshake.authType, handshake.sessionId);
                 
                 // Check banner
                 if (handshake.banner.find(HANDSHAKE_MESSAGE) == 0) {
@@ -603,29 +659,21 @@ static void OnRead(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
                             }
                             
                             if (isRealAuthOk) {
-                                // Authentication successful
                                 state->handshakeOK.store(true);
-                                OH_LOG_INFO(LOG_APP, "Handshake completed successfully (AUTH_OK), sessionId=%{public}u", state->sessionId.load());
+                                OH_LOG_INFO(LOG_APP, "Handshake OK, sessionId=%{public}u", state->sessionId.load());
                             }
                             break;
                         }
                             
                         case Hdc::HdcSessionBase::AUTH_NONE:
-                            // No authentication required
                             state->handshakeOK.store(true);
-                            OH_LOG_INFO(LOG_APP, "Handshake completed successfully (AUTH_NONE), sessionId=%{public}u", state->sessionId.load());
+                            OH_LOG_INFO(LOG_APP, "Handshake OK (no auth), sessionId=%{public}u", state->sessionId.load());
                             break;
                             
                         case Hdc::HdcSessionBase::AUTH_PUBLICKEY: {
-                            // Daemon requests public key - try to send it
-                            OH_LOG_INFO(LOG_APP, "Daemon requests public key authentication");
-                            
-                            // Try to get public key info using HDC auth
+                            // Daemon requests public key
                             std::string pubkeyInfo;
                             if (HdcAuth::GetPublicKeyinfo(pubkeyInfo)) {
-                                OH_LOG_INFO(LOG_APP, "Sending public key to daemon");
-                                
-                                // Build response with public key
                                 Hdc::HdcSessionBase::SessionHandShake response = {};
                                 response.banner = HANDSHAKE_MESSAGE;
                                 response.authType = Hdc::HdcSessionBase::AUTH_PUBLICKEY;
@@ -637,21 +685,16 @@ static void OnRead(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
                                 SendHdcPacket(state, 0, CMD_KERNEL_HANDSHAKE,
                                               reinterpret_cast<const uint8_t*>(responseStr.c_str()), responseStr.size());
                             } else {
-                                OH_LOG_ERROR(LOG_APP, "Failed to get public key, authentication will fail");
+                                OH_LOG_ERROR(LOG_APP, "Failed to get public key");
                                 state->lastError.store(static_cast<int>(ErrorCode::ERR_AUTH_FAILED));
                             }
                             break;
                         }
                             
                         case Hdc::HdcSessionBase::AUTH_SIGNATURE: {
-                            // Daemon requests signature
-                            OH_LOG_INFO(LOG_APP, "Daemon requests signature, token: %{public}s", handshake.buf.c_str());
-                            
-                            // Sign the token
+                            // Daemon requests signature - sign the token
                             std::string signedData = handshake.buf;
                             if (HdcAuth::RsaSignAndBase64(signedData, Hdc::AuthVerifyType::RSA_3072_SHA512)) {
-                                OH_LOG_INFO(LOG_APP, "Sending signature to daemon");
-                                
                                 // Build response with signature
                                 Hdc::HdcSessionBase::SessionHandShake response = {};
                                 response.banner = HANDSHAKE_MESSAGE;
@@ -706,13 +749,10 @@ static void OnRead(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
             
             // Handle CMD_KERNEL_CHANNEL_CLOSE (2)
             if (protectBuf.commandFlag == CMD_KERNEL_CHANNEL_CLOSE) {
-                OH_LOG_INFO(LOG_APP, "Channel closed by daemon, channelId=%{public}u", protectBuf.channelId);
-                
                 // During handshake phase (channelId=0), if we haven't completed handshake yet,
                 // this might be the UNAUTHORIZED notification. Daemon will send AUTH_SIGNATURE
                 // after user authorizes on device. Don't notify waiting thread yet - keep waiting.
                 if (protectBuf.channelId == 0 && !state->handshakeOK.load()) {
-                    OH_LOG_INFO(LOG_APP, "Channel close during handshake, continuing to wait for AUTH_SIGNATURE...");
                     state->responseBuffer.erase(0, sizeof(PayloadHead) + headSize + dataSize);
                     continue;  // Keep waiting for more packets
                 }
@@ -727,15 +767,6 @@ static void OnRead(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
             if (protectBuf.commandFlag == CMD_KERNEL_ECHO) {
                 std::string content(reinterpret_cast<const char*>(payloadData), payloadSize);
                 
-                // Log first 64 bytes in hex for debugging
-                std::string hexDump;
-                for (size_t i = 0; i < std::min(payloadSize, (size_t)64); i++) {
-                    char hex[4];
-                    snprintf(hex, sizeof(hex), "%02x ", (unsigned char)payloadData[i]);
-                    hexDump += hex;
-                }
-                OH_LOG_INFO(LOG_APP, "CMD_KERNEL_ECHO hex dump (first 64 bytes): %{public}s", hexDump.c_str());
-                
                 // Check if this might be a handshake message embedded in echo
                 // Try to parse as SessionHandShake
                 if (payloadSize > 0 && !state->handshakeOK.load()) {
@@ -744,18 +775,11 @@ static void OnRead(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
                     bool parsed = Hdc::SerialStruct::ParseFromString(echoHandshake, echoStr);
                     
                     if (parsed && echoHandshake.banner.find(HANDSHAKE_MESSAGE) == 0) {
-                        OH_LOG_INFO(LOG_APP, "CMD_KERNEL_ECHO contains handshake! banner=%{public}s, authType=%{public}u",
-                                    echoHandshake.banner.c_str(), echoHandshake.authType);
-                        
                         // Process as handshake
                         if (echoHandshake.authType == Hdc::HdcSessionBase::AUTH_SIGNATURE) {
-                            OH_LOG_INFO(LOG_APP, "Found AUTH_SIGNATURE in CMD_KERNEL_ECHO, token: %{public}s", 
-                                        echoHandshake.buf.c_str());
-                            
                             // Sign the token
                             std::string signedData = echoHandshake.buf;
                             if (HdcAuth::RsaSignAndBase64(signedData, Hdc::AuthVerifyType::RSA_3072_SHA512)) {
-                                OH_LOG_INFO(LOG_APP, "Sending signature to daemon (from echo)");
                                 
                                 Hdc::HdcSessionBase::SessionHandShake response = {};
                                 response.banner = HANDSHAKE_MESSAGE;
@@ -770,7 +794,6 @@ static void OnRead(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
                             }
                         } else if (echoHandshake.authType == Hdc::HdcSessionBase::AUTH_OK) {
                             state->handshakeOK.store(true);
-                            OH_LOG_INFO(LOG_APP, "Handshake completed via CMD_KERNEL_ECHO (AUTH_OK)");
                         }
                         
                         state->responseBuffer.erase(0, sizeof(PayloadHead) + headSize + dataSize);
@@ -783,14 +806,33 @@ static void OnRead(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
                 while (!content.empty() && content.back() == '\0') {
                     content.pop_back();
                 }
-                OH_LOG_INFO(LOG_APP, "Received CMD_KERNEL_ECHO (cmd=9), size=%{public}zu, content=[%{public}s]", 
-                            payloadSize, content.c_str());
                 
                 // During handshake phase, ignore echo packets and keep waiting for AUTH_SIGNATURE
                 if (!state->handshakeOK.load()) {
-                    OH_LOG_INFO(LOG_APP, "Ignoring CMD_KERNEL_ECHO during handshake, waiting for AUTH_SIGNATURE...");
                     state->responseBuffer.erase(0, sizeof(PayloadHead) + headSize + dataSize);
                     continue;  // Keep waiting for more packets
+                }
+                
+                // Check if this is a forward port result message
+                // The daemon sends "Forwardport result:OK" via CMD_KERNEL_ECHO before CMD_FORWARD_SUCCESS
+                // But sometimes CMD_FORWARD_SUCCESS may not arrive, so we treat this as success signal
+                if (content.find("Forwardport result:OK") != std::string::npos) {
+                    // Find and mark the forward task as established
+                    std::lock_guard<std::mutex> fwdLock(g_forwardTasksMutex);
+                    for (auto& pair : g_forwardTasks) {
+                        ForwardTask* task = pair.second;
+                        if (task && !task->established && !task->failed) {
+                            std::lock_guard<std::mutex> taskLock(task->mutex);
+                            task->established = true;
+                            task->cv.notify_all();
+                            break;
+                        }
+                    }
+                    
+                    // Remove from buffer and continue
+                    state->responseBuffer.erase(0, sizeof(PayloadHead) + headSize + dataSize);
+                    state->cv.notify_all();
+                    continue;
                 }
                 
                 // After handshake, leave in buffer for SendCommandAndWait to process
@@ -803,21 +845,34 @@ static void OnRead(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
             // CMD_SHELL_DATA (2001) is used for interactive shell output
             if (protectBuf.commandFlag == CMD_KERNEL_ECHO_RAW || 
                 protectBuf.commandFlag == CMD_SHELL_DATA) {
-                std::string content(reinterpret_cast<const char*>(payloadData), payloadSize);
-                // Remove trailing nulls for display
-                while (!content.empty() && content.back() == '\0') {
-                    content.pop_back();
-                }
-                OH_LOG_INFO(LOG_APP, "Received response (cmd=%{public}u), size=%{public}zu, content=[%{public}s]", 
-                            protectBuf.commandFlag, payloadSize, content.c_str());
-                
                 // Leave in buffer for SendCommandAndWait to process
                 state->cv.notify_all();
                 break;
             }
             
-            // For other unknown commands, log and remove from buffer
-            OH_LOG_INFO(LOG_APP, "Received unknown cmd=%{public}u, removing from buffer", protectBuf.commandFlag);
+            // Handle Forward protocol messages
+            if (protectBuf.commandFlag == CMD_KERNEL_WAKEUP_SLAVETASK ||
+                protectBuf.commandFlag == CMD_FORWARD_CHECK ||
+                protectBuf.commandFlag == CMD_FORWARD_CHECK_RESULT ||
+                protectBuf.commandFlag == CMD_FORWARD_ACTIVE_SLAVE ||
+                protectBuf.commandFlag == CMD_FORWARD_ACTIVE_MASTER ||
+                protectBuf.commandFlag == CMD_FORWARD_DATA ||
+                protectBuf.commandFlag == CMD_FORWARD_FREE_CONTEXT ||
+                protectBuf.commandFlag == CMD_FORWARD_SUCCESS) {
+                // Process forward message
+                ProcessForwardMessage(protectBuf.commandFlag, protectBuf.channelId, payloadData, payloadSize);
+                
+                // Remove processed packet from buffer
+                state->responseBuffer.erase(0, totalPacketSize);
+                
+                // For CMD_FORWARD_SUCCESS, also notify waiting thread
+                if (protectBuf.commandFlag == CMD_FORWARD_SUCCESS) {
+                    state->cv.notify_all();
+                }
+                continue;
+            }
+            
+            // For other unknown commands, remove from buffer
             state->responseBuffer.erase(0, totalPacketSize);
             // Continue processing remaining packets
         }
@@ -862,9 +917,6 @@ static bool SendHdcPacket(ConnectionState* state, uint32_t channelId, uint16_t c
         memcpy(packet.data() + sizeof(PayloadHead) + protectStr.size(), data, dataSize);
     }
     
-    OH_LOG_INFO(LOG_APP, "Sending packet: cmd=%{public}u, headSize=%{public}zu, dataSize=%{public}zu, total=%{public}zu",
-                commandFlag, protectStr.size(), dataSize, totalSize);
-    
     // Send packet
     uv_buf_t buf = uv_buf_init(reinterpret_cast<char*>(packet.data()), totalSize);
     uv_write_t* writeReq = new uv_write_t();
@@ -887,6 +939,374 @@ static bool SendHdcPacket(ConnectionState* state, uint32_t channelId, uint16_t c
     return ret == 0;
 }
 
+// ============================================================================
+// Forward Protocol Implementation
+// ============================================================================
+
+// Generate a unique context ID
+static uint32_t GenerateContextId() {
+    static std::atomic<uint32_t> contextCounter{1};
+    return contextCounter++;
+}
+
+// Parse port specification (e.g., "tcp:8080" -> type="tcp", port=8080)
+static bool ParsePortSpec(const std::string& spec, std::string& type, int& port) {
+    size_t colonPos = spec.find(':');
+    if (colonPos == std::string::npos || colonPos == 0 || colonPos == spec.length() - 1) {
+        return false;
+    }
+    type = spec.substr(0, colonPos);
+    std::string portStr = spec.substr(colonPos + 1);
+    try {
+        port = std::stoi(portStr);
+        if (port <= 0 || port > 65535) {
+            return false;
+        }
+    } catch (...) {
+        return false;
+    }
+    return true;
+}
+
+// Get forward task by channel ID
+static ForwardTask* GetForwardTask(uint32_t channelId) {
+    std::lock_guard<std::mutex> lock(g_forwardTasksMutex);
+    auto it = g_forwardTasks.find(channelId);
+    if (it != g_forwardTasks.end()) {
+        return it->second;
+    }
+    return nullptr;
+}
+
+// Get forward context by context ID
+static ForwardContext* GetForwardContext(ForwardTask* task, uint32_t contextId) {
+    if (!task) return nullptr;
+    std::lock_guard<std::mutex> lock(task->mutex);
+    auto it = task->contexts.find(contextId);
+    if (it != task->contexts.end()) {
+        return it->second;
+    }
+    return nullptr;
+}
+
+// Send forward packet with context ID prefix
+static bool SendForwardPacket(uint32_t channelId, uint32_t contextId, uint16_t command, 
+                              const uint8_t* data, size_t dataSize) {
+    if (!g_connState || !g_connState->connected.load()) {
+        return false;
+    }
+    
+    // Build packet with context ID prefix (4 bytes, network byte order)
+    size_t totalSize = DWORD_SERIALIZE_SIZE + dataSize;
+    std::vector<uint8_t> payload(totalSize);
+    
+    // Write context ID in network byte order
+    uint32_t netContextId = htonl(contextId);
+    memcpy(payload.data(), &netContextId, DWORD_SERIALIZE_SIZE);
+    
+    // Copy data if any
+    if (data && dataSize > 0) {
+        memcpy(payload.data() + DWORD_SERIALIZE_SIZE, data, dataSize);
+    }
+    
+    return SendHdcPacket(g_connState, channelId, command, payload.data(), totalSize);
+}
+
+// Allocate buffer for forward read
+static void ForwardAllocCallback(uv_handle_t* handle, size_t suggested_size, uv_buf_t* buf) {
+    size_t size = suggested_size > 65536 ? 65536 : suggested_size;
+    buf->base = new char[size];
+    buf->len = size;
+}
+
+// Handle data read from local TCP connection, forward to daemon
+static void ForwardReadCallback(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
+    ForwardContext* ctx = static_cast<ForwardContext*>(stream->data);
+    if (!ctx) {
+        if (buf->base) delete[] buf->base;
+        return;
+    }
+    
+    if (nread < 0) {
+        // Notify daemon to free context
+        ForwardTask* task = GetForwardTask(ctx->channelId);
+        if (task) {
+            SendForwardPacket(ctx->channelId, ctx->id, CMD_FORWARD_FREE_CONTEXT, nullptr, 0);
+        }
+        // Close local handle
+        if (!uv_is_closing((uv_handle_t*)stream)) {
+            uv_close((uv_handle_t*)stream, [](uv_handle_t* handle) {
+                ForwardContext* c = static_cast<ForwardContext*>(handle->data);
+                if (c) {
+                    c->finished = true;
+                }
+            });
+        }
+        if (buf->base) delete[] buf->base;
+        return;
+    }
+    
+    if (nread == 0) {
+        if (buf->base) delete[] buf->base;
+        return;
+    }
+    
+    // Forward data to daemon
+    ForwardTask* task = GetForwardTask(ctx->channelId);
+    if (task && ctx->ready) {
+        SendForwardPacket(ctx->channelId, ctx->id, CMD_FORWARD_DATA, 
+                         reinterpret_cast<uint8_t*>(buf->base), nread);
+    }
+    
+    if (buf->base) delete[] buf->base;
+}
+
+// Handle new connection on local listener
+static void ForwardListenCallback(uv_stream_t* server, int status) {
+    ForwardTask* task = static_cast<ForwardTask*>(server->data);
+    if (!task || status < 0) {
+        return;
+    }
+    
+    // Create new context for this connection
+    ForwardContext* ctx = new ForwardContext();
+    ctx->id = GenerateContextId();
+    ctx->channelId = task->channelId;
+    ctx->masterSlave = true;
+    ctx->ready = false;
+    ctx->finished = false;
+    ctx->checkPoint = false;
+    ctx->localSpec = task->localSpec;
+    ctx->remoteSpec = task->remoteSpec;
+    ctx->localPort = task->localPort;
+    
+    // Initialize TCP handle for this connection
+    uv_tcp_init(server->loop, &ctx->tcpHandle);
+    ctx->tcpHandle.data = ctx;
+    
+    // Accept the connection
+    if (uv_accept(server, (uv_stream_t*)&ctx->tcpHandle) != 0) {
+        uv_close((uv_handle_t*)&ctx->tcpHandle, nullptr);
+        delete ctx;
+        return;
+    }
+    
+    // Add context to task
+    {
+        std::lock_guard<std::mutex> lock(task->mutex);
+        task->contexts[ctx->id] = ctx;
+    }
+    
+    // Build CMD_FORWARD_ACTIVE_SLAVE payload
+    // Format: [4 bytes context ID][8 bytes param][remote spec string]
+    std::vector<uint8_t> payload;
+    payload.resize(FORWARD_PARAM_BUF_SIZE + task->remoteSpec.length() + 1);
+    memset(payload.data(), 0, FORWARD_PARAM_BUF_SIZE);
+    memcpy(payload.data() + FORWARD_PARAM_BUF_SIZE, task->remoteSpec.c_str(), task->remoteSpec.length() + 1);
+    
+    // Send CMD_FORWARD_ACTIVE_SLAVE to daemon
+    SendForwardPacket(task->channelId, ctx->id, CMD_FORWARD_ACTIVE_SLAVE, 
+                     payload.data(), payload.size());
+}
+
+// Handle CMD_FORWARD_CHECK from daemon
+static void HandleForwardCheck(uint32_t channelId, const uint8_t* payload, size_t payloadSize) {
+    if (payloadSize <= DWORD_SERIALIZE_SIZE + FORWARD_PARAM_BUF_SIZE) {
+        return;
+    }
+    
+    // Parse context ID
+    uint32_t contextId = ntohl(*reinterpret_cast<const uint32_t*>(payload));
+    
+    ForwardTask* task = GetForwardTask(channelId);
+    if (!task) {
+        return;
+    }
+    
+    // Send CHECK_RESULT with success
+    uint8_t result = 1;  // Success
+    SendForwardPacket(channelId, contextId, CMD_FORWARD_CHECK_RESULT, &result, 1);
+}
+
+// Handle CMD_FORWARD_CHECK_RESULT from daemon
+static void HandleForwardCheckResult(uint32_t channelId, const uint8_t* payload, size_t payloadSize) {
+    if (payloadSize <= DWORD_SERIALIZE_SIZE) {
+        return;
+    }
+    
+    uint32_t contextId = ntohl(*reinterpret_cast<const uint32_t*>(payload));
+    uint8_t result = payload[DWORD_SERIALIZE_SIZE];
+    
+    ForwardTask* task = GetForwardTask(channelId);
+    if (!task) {
+        return;
+    }
+    
+    if (!result) {
+        // Check failed
+        std::lock_guard<std::mutex> lock(task->mutex);
+        task->failed = true;
+        task->errorMessage = "Remote port check failed";
+        task->cv.notify_all();
+    }
+}
+
+// Handle CMD_FORWARD_ACTIVE_MASTER from daemon
+static void HandleForwardActiveMaster(uint32_t channelId, const uint8_t* payload, size_t payloadSize) {
+    uint32_t contextId = 0;
+    if (payloadSize >= DWORD_SERIALIZE_SIZE) {
+        contextId = ntohl(*reinterpret_cast<const uint32_t*>(payload));
+    }
+    
+    ForwardTask* task = GetForwardTask(channelId);
+    if (!task) {
+        return;
+    }
+    
+    ForwardContext* ctx = GetForwardContext(task, contextId);
+    if (ctx) {
+        ctx->ready = true;
+        // Start reading from local connection
+        uv_read_start((uv_stream_t*)&ctx->tcpHandle, ForwardAllocCallback, ForwardReadCallback);
+    }
+}
+
+// Handle CMD_FORWARD_ACTIVE_SLAVE from daemon (for reverse forward)
+static void HandleForwardActiveSlave(uint32_t channelId, const uint8_t* payload, size_t payloadSize) {
+    // This is for reverse forward, not implemented yet
+}
+
+// Handle CMD_FORWARD_DATA from daemon
+static void HandleForwardData(uint32_t channelId, const uint8_t* payload, size_t payloadSize) {
+    if (payloadSize <= DWORD_SERIALIZE_SIZE) {
+        return;
+    }
+    
+    uint32_t contextId = ntohl(*reinterpret_cast<const uint32_t*>(payload));
+    const uint8_t* data = payload + DWORD_SERIALIZE_SIZE;
+    size_t dataSize = payloadSize - DWORD_SERIALIZE_SIZE;
+    
+    ForwardTask* task = GetForwardTask(channelId);
+    if (!task) {
+        return;
+    }
+    
+    ForwardContext* ctx = GetForwardContext(task, contextId);
+    if (!ctx || ctx->finished || !ctx->ready) {
+        return;
+    }
+    
+    // Write data to local TCP connection
+    uv_buf_t buf;
+    buf.base = new char[dataSize];
+    buf.len = dataSize;
+    memcpy(buf.base, data, dataSize);
+    
+    uv_write_t* writeReq = new uv_write_t();
+    writeReq->data = buf.base;
+    
+    int ret = uv_write(writeReq, (uv_stream_t*)&ctx->tcpHandle, &buf, 1, 
+             [](uv_write_t* req, int status) {
+                 if (status < 0) {
+                     OH_LOG_ERROR(LOG_APP, "Forward write to local failed: %{public}s", uv_strerror(status));
+                 }
+                 delete[] static_cast<char*>(req->data);
+                 delete req;
+             });
+    
+    if (ret != 0) {
+        delete[] buf.base;
+        delete writeReq;
+    }
+}
+
+// Handle CMD_FORWARD_FREE_CONTEXT from daemon
+static void HandleForwardFreeContext(uint32_t channelId, const uint8_t* payload, size_t payloadSize) {
+    uint32_t contextId = 0;
+    if (payloadSize >= DWORD_SERIALIZE_SIZE) {
+        contextId = ntohl(*reinterpret_cast<const uint32_t*>(payload));
+    }
+    
+    ForwardTask* task = GetForwardTask(channelId);
+    if (!task) {
+        return;
+    }
+    
+    ForwardContext* ctx = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(task->mutex);
+        auto it = task->contexts.find(contextId);
+        if (it != task->contexts.end()) {
+            ctx = it->second;
+            task->contexts.erase(it);
+        }
+    }
+    
+    if (ctx && !ctx->finished) {
+        ctx->finished = true;
+        if (!uv_is_closing((uv_handle_t*)&ctx->tcpHandle)) {
+            uv_close((uv_handle_t*)&ctx->tcpHandle, [](uv_handle_t* handle) {
+                ForwardContext* c = static_cast<ForwardContext*>(handle->data);
+                delete c;
+            });
+        } else {
+            delete ctx;
+        }
+    }
+}
+
+// Handle CMD_FORWARD_SUCCESS from daemon
+static void HandleForwardSuccess(uint32_t channelId, const uint8_t* payload, size_t payloadSize) {
+    ForwardTask* task = GetForwardTask(channelId);
+    if (!task) {
+        return;
+    }
+    
+    std::lock_guard<std::mutex> lock(task->mutex);
+    task->established = true;
+    task->cv.notify_all();
+    
+    OH_LOG_INFO(LOG_APP, "Forward established: %{public}s -> %{public}s", 
+                task->localSpec.c_str(), task->remoteSpec.c_str());
+}
+
+// Process forward protocol message
+static void ProcessForwardMessage(uint16_t command, uint32_t channelId, 
+                                  const uint8_t* payload, size_t payloadSize) {
+    switch (command) {
+        case CMD_FORWARD_CHECK:
+            HandleForwardCheck(channelId, payload, payloadSize);
+            break;
+        case CMD_FORWARD_CHECK_RESULT:
+            HandleForwardCheckResult(channelId, payload, payloadSize);
+            break;
+        case CMD_FORWARD_ACTIVE_MASTER:
+            HandleForwardActiveMaster(channelId, payload, payloadSize);
+            break;
+        case CMD_FORWARD_ACTIVE_SLAVE:
+            HandleForwardActiveSlave(channelId, payload, payloadSize);
+            break;
+        case CMD_FORWARD_DATA:
+            HandleForwardData(channelId, payload, payloadSize);
+            break;
+        case CMD_FORWARD_FREE_CONTEXT:
+            HandleForwardFreeContext(channelId, payload, payloadSize);
+            break;
+        case CMD_FORWARD_SUCCESS:
+            HandleForwardSuccess(channelId, payload, payloadSize);
+            break;
+        case CMD_KERNEL_WAKEUP_SLAVETASK:
+            // Wakeup slave task, no action needed
+            break;
+        default:
+            break;
+    }
+}
+
+// ============================================================================
+// End Forward Protocol Implementation
+// ============================================================================
+
 // Generate a pseudo-random session ID using timestamp and random
 static uint32_t GenerateSessionId() {
     // Use a combination of timestamp and random to avoid conflicts with daemon's old sessions
@@ -906,8 +1326,6 @@ static void SendInitialHandshake(ConnectionState* state) {
     // Generate session ID for this connection
     state->sessionId.store(GenerateSessionId());
     
-    OH_LOG_INFO(LOG_APP, "Sending initial handshake, sessionId=%{public}u", state->sessionId.load());
-    
     // Build SessionHandShake (client sends first, like HDC server does)
     Hdc::HdcSessionBase::SessionHandShake handshake = {};
     handshake.banner = HANDSHAKE_MESSAGE;
@@ -917,14 +1335,10 @@ static void SendInitialHandshake(ConnectionState* state) {
     handshake.version = Hdc::Base::GetVersion();
     
     // Tell daemon we support RSA_3072_SHA512 authentication
-    // This is critical! Without this, daemon will use RSA_ENCRYPT which doesn't match our signing method
     Hdc::Base::TlvAppend(handshake.buf, TAG_AUTH_TYPE, std::to_string(Hdc::AuthVerifyType::RSA_3072_SHA512));
     
     // Serialize handshake using TLV
     std::string handshakeStr = Hdc::SerialStruct::SerializeToString(handshake);
-    
-    OH_LOG_INFO(LOG_APP, "Initial handshake: banner=%{public}s, authType=%{public}u, connectKey=%{public}s, version=%{public}s, authMethod=RSA_3072_SHA512",
-                handshake.banner.c_str(), handshake.authType, handshake.connectKey.c_str(), handshake.version.c_str());
     
     // Send as CMD_KERNEL_HANDSHAKE packet
     SendHdcPacket(state, 0, CMD_KERNEL_HANDSHAKE, 
@@ -935,8 +1349,6 @@ static void SendInitialHandshake(ConnectionState* state) {
 
 // Send handshake response to daemon (when daemon sends handshake back)
 static void SendHandshakeResponse(ConnectionState* state, uint32_t sessionId) {
-    OH_LOG_INFO(LOG_APP, "Sending handshake response, sessionId=%{public}u", sessionId);
-    
     // Build SessionHandShake response
     Hdc::HdcSessionBase::SessionHandShake handshake = {};
     handshake.banner = HANDSHAKE_MESSAGE;
@@ -948,27 +1360,20 @@ static void SendHandshakeResponse(ConnectionState* state, uint32_t sessionId) {
     // Serialize handshake using TLV
     std::string handshakeStr = Hdc::SerialStruct::SerializeToString(handshake);
     
-    OH_LOG_INFO(LOG_APP, "Handshake response: banner=%{public}s, authType=%{public}u, connectKey=%{public}s, version=%{public}s",
-                handshake.banner.c_str(), handshake.authType, handshake.connectKey.c_str(), handshake.version.c_str());
-    
     // Send as CMD_KERNEL_HANDSHAKE packet
     SendHdcPacket(state, 0, CMD_KERNEL_HANDSHAKE, 
                   reinterpret_cast<const uint8_t*>(handshakeStr.c_str()), handshakeStr.size());
 }
 
 static void OnConnect(uv_connect_t* req, int status) {
-    OH_LOG_INFO(LOG_APP, "OnConnect callback called, status=%{public}d", status);
-    
     ConnectionState* state = (ConnectionState*)req->data;
     if (state == nullptr) {
-        OH_LOG_ERROR(LOG_APP, "OnConnect: state is null!");
         return;
     }
     
     // Check if this callback is for the current connection or an old one being cleaned up
     ConnectionState* currentState = g_connState;
     if (currentState != state) {
-        OH_LOG_WARN(LOG_APP, "OnConnect: callback for old connection state, ignoring (status=%{public}d)", status);
         // Still need to close the handle if connection failed
         if (status < 0 && !uv_is_closing((uv_handle_t*)&state->tcpHandle)) {
             uv_close((uv_handle_t*)&state->tcpHandle, nullptr);
@@ -979,46 +1384,30 @@ static void OnConnect(uv_connect_t* req, int status) {
     if (status < 0) {
         // Map libuv error to more specific error codes
         int errorCode = static_cast<int>(ErrorCode::ERR_CONNECTION_FAILED);
-        const char* errorDetail = "";
         
         switch (status) {
             case UV_ETIMEDOUT:
                 errorCode = static_cast<int>(ErrorCode::ERR_CONNECTION_TIMEOUT);
-                errorDetail = "Connection timed out";
                 break;
             case UV_ECONNREFUSED:
                 errorCode = static_cast<int>(ErrorCode::ERR_CONNECTION_REFUSED);
-                errorDetail = "Connection refused - check if HDC daemon is running on target";
                 break;
             case UV_ENETUNREACH:
-                errorCode = static_cast<int>(ErrorCode::ERR_CONNECTION_FAILED);
-                errorDetail = "Network unreachable - check if device is on same network";
-                break;
             case UV_EHOSTUNREACH:
                 errorCode = static_cast<int>(ErrorCode::ERR_CONNECTION_FAILED);
-                errorDetail = "Host unreachable - check IP address and network connectivity";
                 break;
             case UV_ECONNRESET:
-                errorCode = static_cast<int>(ErrorCode::ERR_CONNECTION_CLOSED);
-                errorDetail = "Connection reset by peer";
-                break;
             case UV_ECANCELED:
                 errorCode = static_cast<int>(ErrorCode::ERR_CONNECTION_CLOSED);
-                errorDetail = "Connection canceled (handle closed during connect)";
-                break;
-            default:
-                errorDetail = "Unknown connection error";
                 break;
         }
         
-        OH_LOG_ERROR(LOG_APP, "Connect failed: %{public}s (code=%{public}d). %{public}s. Target: %{public}s", 
-                    uv_strerror(status), status, errorDetail, state->connectKey.c_str());
+        OH_LOG_ERROR(LOG_APP, "Connect failed: %{public}s", uv_strerror(status));
         
         state->lastError.store(errorCode);
         state->connected.store(false);
         
         // Close the TCP handle since connection failed
-        // This is important to clean up resources properly
         if (!uv_is_closing((uv_handle_t*)&state->tcpHandle)) {
             uv_close((uv_handle_t*)&state->tcpHandle, nullptr);
         }
@@ -1027,15 +1416,13 @@ static void OnConnect(uv_connect_t* req, int status) {
         return;
     }
     
-    OH_LOG_INFO(LOG_APP, "TCP connected, sending initial handshake");
     state->connected.store(true);
     state->tcpHandle.data = state;
     
     // Start reading for daemon's response
     uv_read_start((uv_stream_t*)&state->tcpHandle, OnAllocBuffer, OnRead);
     
-    // Client sends handshake first (like HDC server does when connecting to daemon)
-    // The daemon will respond with its own handshake
+    // Client sends handshake first
     SendInitialHandshake(state);
     
     state->cv.notify_all();
@@ -1053,88 +1440,75 @@ struct CloseContext {
 int HdcClientWrapper::ConnectInternal(const std::string& host, uint16_t port, int timeoutMs) {
     // Cleanup previous connection (but keep the event loop running!)
     if (g_connState != nullptr) {
-        OH_LOG_INFO(LOG_APP, "Cleaning up previous connection before reconnect");
+        // Cleanup forward tasks and reset channel ID counter first
+        CleanupForwardTasks();
         
         ConnectionState* oldState = g_connState;
         g_connState = nullptr;  // Clear global pointer first to prevent callbacks from using it
         
         // Always try to close the TCP handle if loop exists
-        // The handle may have been initialized even if connection failed
         if (loop_ != nullptr) {
             // Create close context on heap - will be deleted in close callback
             CloseContext* closeCtx = new CloseContext();
             closeCtx->oldState = oldState;
             closeCtx->shouldDeleteState = true;
             
-            // Check if handle needs to be closed
-            // Note: The handle might already be closing from OnConnect failure callback
             bool needClose = false;
-            bool alreadyClosing = uv_is_closing((uv_handle_t*)&oldState->tcpHandle);
+            bool alreadyClosing = false;
             
-            if (!alreadyClosing) {
-                // Stop reading first if connected
-                if (oldState->connected.load()) {
-                    uv_read_stop((uv_stream_t*)&oldState->tcpHandle);
+            // Hold the lock while checking and initiating close to synchronize with RunEventLoop
+            {
+                std::lock_guard<std::mutex> lock(g_loopMutex);
+                
+                alreadyClosing = uv_is_closing((uv_handle_t*)&oldState->tcpHandle);
+                
+                if (!alreadyClosing) {
+                    // Stop reading first if connected
+                    if (oldState->connected.load()) {
+                        uv_read_stop((uv_stream_t*)&oldState->tcpHandle);
+                    }
+                    needClose = true;
+                    
+                    // Store close context in handle data
+                    oldState->tcpHandle.data = closeCtx;
+                    
+                    // Close the handle - the callback will clean up asynchronously
+                    uv_close((uv_handle_t*)&oldState->tcpHandle, [](uv_handle_t* handle) {
+                        CloseContext* ctx = static_cast<CloseContext*>(handle->data);
+                        if (ctx) {
+                            ctx->closed = true;
+                            if (ctx->shouldDeleteState && ctx->oldState) {
+                                delete ctx->oldState;
+                                ctx->oldState = nullptr;
+                            }
+                            delete ctx;
+                        }
+                    });
                 }
-                needClose = true;
-            } else {
-                OH_LOG_INFO(LOG_APP, "TCP handle already closing, waiting for it to complete");
             }
             
             if (needClose) {
-                // Store close context in handle data
-                oldState->tcpHandle.data = closeCtx;
-                
-                // Close the handle - the callback will clean up asynchronously
-                // Don't wait for completion - let the event loop handle it
-                uv_close((uv_handle_t*)&oldState->tcpHandle, [](uv_handle_t* handle) {
-                    CloseContext* ctx = static_cast<CloseContext*>(handle->data);
-                    if (ctx) {
-                        ctx->closed = true;
-                        // Delete the old state in the callback to ensure it's safe
-                        if (ctx->shouldDeleteState && ctx->oldState) {
-                            delete ctx->oldState;
-                            ctx->oldState = nullptr;
-                        }
-                        // Delete the context itself
-                        delete ctx;
-                    }
-                });
-                
-                // Wait for close to complete to avoid "operation canceled" errors
-                // when starting a new connection
-                OH_LOG_INFO(LOG_APP, "TCP handle close initiated, waiting for completion...");
+                // Wait for close to complete
                 int closeWaitCount = 0;
                 const int maxCloseWait = 100;  // Max 1 second wait
                 while (!closeCtx->closed.load() && closeWaitCount < maxCloseWait) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(10));
                     closeWaitCount++;
                 }
-                if (closeCtx->closed.load()) {
-                    OH_LOG_INFO(LOG_APP, "TCP handle closed successfully");
-                } else {
-                    OH_LOG_WARN(LOG_APP, "TCP handle close timeout, proceeding anyway");
-                    // closeCtx will be deleted by the callback eventually
-                }
             } else {
-                // Handle already closing, wait for it to complete
-                // We can't set up our own close callback, so just wait and then delete
                 delete closeCtx;
                 
                 // Wait for the handle to finish closing
                 int closeWaitCount = 0;
-                const int maxCloseWait = 100;  // Max 1 second wait
+                const int maxCloseWait = 100;
                 while (uv_is_closing((uv_handle_t*)&oldState->tcpHandle) && closeWaitCount < maxCloseWait) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(10));
                     closeWaitCount++;
                 }
-                OH_LOG_INFO(LOG_APP, "Waited %d ms for handle to close", closeWaitCount * 10);
                 
-                // Now safe to delete the state
                 delete oldState;
             }
         } else {
-            // No loop, just delete the state
             delete oldState;
         }
         
@@ -1147,7 +1521,6 @@ int HdcClientWrapper::ConnectInternal(const std::string& host, uint16_t port, in
         std::lock_guard<std::mutex> lock(g_loopMutex);
         
         if (loop_ == nullptr) {
-            OH_LOG_INFO(LOG_APP, "Creating event loop");
             loop_ = new uv_loop_t();
             int ret = uv_loop_init(loop_);
             if (ret != 0) {
@@ -1161,7 +1534,6 @@ int HdcClientWrapper::ConnectInternal(const std::string& host, uint16_t port, in
     
     // Start event loop thread if not running
     if (!loopRunning_) {
-        OH_LOG_INFO(LOG_APP, "Starting event loop thread");
         std::thread loopThread([this]() {
             RunEventLoop();
         });
@@ -1256,8 +1628,6 @@ int HdcClientWrapper::ConnectInternal(const std::string& host, uint16_t port, in
         // Log the parsed address for debugging
         char addrStr[INET_ADDRSTRLEN];
         uv_ip4_name(&dest, addrStr, sizeof(addrStr));
-        OH_LOG_INFO(LOG_APP, "Connecting to %{public}s:%{public}d (parsed: %{public}s:%{public}d)", 
-                   ctx->host.c_str(), ctx->port, addrStr, ntohs(dest.sin_port));
         
         // Connect
         ctx->state->connectReq.data = ctx->state;
@@ -1334,7 +1704,6 @@ int HdcClientWrapper::ConnectInternal(const std::string& host, uint16_t port, in
             if (remainingTimeout == timeoutMs) {
                 // First time detecting user auth wait, extend timeout
                 remainingTimeout = USER_AUTH_TIMEOUT_MS;
-                OH_LOG_INFO(LOG_APP, "Extended timeout to %{public}d ms for user authorization", USER_AUTH_TIMEOUT_MS);
             } else {
                 remainingTimeout -= waitTime;
             }
@@ -1370,44 +1739,38 @@ int HdcClientWrapper::Connect(const std::string& host, uint16_t port, int timeou
         return static_cast<int>(ErrorCode::ERR_NOT_INITIALIZED);
     }
     
-    OH_LOG_INFO(LOG_APP, "Connecting to %{public}s:%{public}d timeout=%{public}d", 
+    OH_LOG_INFO(LOG_APP, "Connect: %{public}s:%{public}d, timeout=%{public}d", 
                 host.c_str(), port, timeoutMs);
     
     // Try to connect with automatic retry
-    // First connection often fails because daemon may have stale session state
     const int maxRetries = 3;
-    const int retryDelayMs = 500;  // Wait 500ms between retries
+    const int retryDelayMs = 500;
     int lastError = 0;
     
     for (int attempt = 1; attempt <= maxRetries; attempt++) {
-        OH_LOG_INFO(LOG_APP, "Connection attempt %{public}d/%{public}d", attempt, maxRetries);
-        
         int result = ConnectInternal(host, port, timeoutMs);
         if (result == static_cast<int>(ErrorCode::SUCCESS)) {
-            OH_LOG_INFO(LOG_APP, "Connected successfully to %{public}s on attempt %{public}d", 
-                        currentConnectKey_.c_str(), attempt);
+            OH_LOG_INFO(LOG_APP, "Connect: success on attempt %{public}d", attempt);
             SetLastError(static_cast<int>(ErrorCode::SUCCESS));
             return static_cast<int>(ErrorCode::SUCCESS);
         }
         
         lastError = result;
-        OH_LOG_WARN(LOG_APP, "Connection attempt %{public}d failed with error %{public}d", attempt, result);
+        OH_LOG_WARN(LOG_APP, "Connect: attempt %{public}d failed, error=%{public}d", attempt, result);
         
         // Don't retry on certain errors
         if (result == static_cast<int>(ErrorCode::ERR_AUTH_FAILED) ||
             result == static_cast<int>(ErrorCode::ERR_AUTH_REJECTED)) {
-            OH_LOG_ERROR(LOG_APP, "Authentication error, not retrying");
             break;
         }
         
         // Wait before retry (except for last attempt)
         if (attempt < maxRetries) {
-            OH_LOG_INFO(LOG_APP, "Waiting %{public}dms before retry...", retryDelayMs);
             std::this_thread::sleep_for(std::chrono::milliseconds(retryDelayMs));
         }
     }
     
-    OH_LOG_ERROR(LOG_APP, "All connection attempts failed, last error: %{public}d", lastError);
+    OH_LOG_ERROR(LOG_APP, "Connect: failed, error=%{public}d", lastError);
     SetLastError(lastError);
     return lastError;
 }
@@ -1418,7 +1781,10 @@ int HdcClientWrapper::Disconnect(const std::string& connId) {
         return static_cast<int>(ErrorCode::ERR_NOT_INITIALIZED);
     }
     
-    OH_LOG_INFO(LOG_APP, "Disconnecting from %{public}s", connId.c_str());
+    OH_LOG_INFO(LOG_APP, "Disconnect: %{public}s", connId.c_str());
+    
+    // Cleanup forward tasks and reset channel ID counter first
+    CleanupForwardTasks();
     
     // Only close the TCP connection, keep the event loop running
     if (g_connState != nullptr) {
@@ -1431,41 +1797,39 @@ int HdcClientWrapper::Disconnect(const std::string& connId) {
             closeCtx->oldState = oldState;
             closeCtx->shouldDeleteState = true;
             
-            // Stop reading first
-            if (!uv_is_closing((uv_handle_t*)&oldState->tcpHandle)) {
-                uv_read_stop((uv_stream_t*)&oldState->tcpHandle);
+            // Hold the lock while operating on libuv handles to synchronize with RunEventLoop
+            {
+                std::lock_guard<std::mutex> lock(g_loopMutex);
                 
-                // Store close context in handle data
-                oldState->tcpHandle.data = closeCtx;
-                
-                // Close handle - the callback will clean up asynchronously
-                // Don't wait for completion - let the event loop handle it
-                uv_close((uv_handle_t*)&oldState->tcpHandle, [](uv_handle_t* handle) {
-                    CloseContext* ctx = static_cast<CloseContext*>(handle->data);
-                    if (ctx) {
-                        ctx->closed = true;
-                        // Delete the old state in the callback
-                        if (ctx->shouldDeleteState && ctx->oldState) {
-                            delete ctx->oldState;
-                            ctx->oldState = nullptr;
+                // Stop reading first
+                if (!uv_is_closing((uv_handle_t*)&oldState->tcpHandle)) {
+                    uv_read_stop((uv_stream_t*)&oldState->tcpHandle);
+                    
+                    // Store close context in handle data
+                    oldState->tcpHandle.data = closeCtx;
+                    
+                    // Close handle - the callback will clean up asynchronously
+                    uv_close((uv_handle_t*)&oldState->tcpHandle, [](uv_handle_t* handle) {
+                        CloseContext* ctx = static_cast<CloseContext*>(handle->data);
+                        if (ctx) {
+                            ctx->closed = true;
+                            // Delete the old state in the callback
+                            if (ctx->shouldDeleteState && ctx->oldState) {
+                                delete ctx->oldState;
+                                ctx->oldState = nullptr;
+                            }
+                            delete ctx;
                         }
-                        delete ctx;
-                    }
-                });
-                
-                // Don't wait for close to complete - let it happen asynchronously
-                // The callback will clean up resources when the event loop processes it
-                OH_LOG_INFO(LOG_APP, "TCP handle close initiated, cleanup will happen asynchronously");
-                // Note: closeCtx and oldState are deleted in the callback, not here
-            } else {
-                // Handle already closing
-                delete closeCtx;
-                delete oldState;
+                    });
+                } else {
+                    // Handle already closing
+                    delete closeCtx;
+                    delete oldState;
+                }
             }
         } else {
             delete oldState;
         }
-        // Note: g_connState was already set to nullptr at the beginning
     }
     
     currentConnectKey_.clear();
@@ -1500,9 +1864,6 @@ int HdcClientWrapper::WaitForDevice(const std::string& host, uint16_t port, int 
         SetLastError(static_cast<int>(ErrorCode::ERR_NOT_INITIALIZED));
         return static_cast<int>(ErrorCode::ERR_NOT_INITIALIZED);
     }
-    
-    OH_LOG_INFO(LOG_APP, "WaitForDevice %{public}s:%{public}d timeout=%{public}d", 
-                host.c_str(), port, timeoutMs);
     
     auto startTime = std::chrono::steady_clock::now();
     int retryInterval = 1000; // 1 second
@@ -1554,8 +1915,6 @@ std::vector<DeviceInfo> HdcClientWrapper::Discover(int timeoutMs) {
         return devices;
     }
     
-    OH_LOG_INFO(LOG_APP, "Discovering devices, timeout=%{public}d", timeoutMs);
-    
     // Create UDP socket for broadcast
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (sock < 0) {
@@ -1603,13 +1962,10 @@ std::vector<DeviceInfo> HdcClientWrapper::Discover(int timeoutMs) {
     ssize_t sent = sendto(sock, DISCOVER_MESSAGE, strlen(DISCOVER_MESSAGE), 0,
                           (struct sockaddr*)&broadcastAddr, sizeof(broadcastAddr));
     if (sent < 0) {
-        OH_LOG_ERROR(LOG_APP, "Discover: failed to send broadcast");
         close(sock);
         SetLastError(static_cast<int>(ErrorCode::ERR_DISCOVERY_FAILED));
         return devices;
     }
-    
-    OH_LOG_INFO(LOG_APP, "Discover: broadcast sent, waiting for responses...");
     
     // Receive responses
     char recvBuf[DISCOVER_RECV_BUF_SIZE];
@@ -1657,7 +2013,6 @@ std::vector<DeviceInfo> HdcClientWrapper::Discover(int timeoutMs) {
                 }
                 
                 if (!isDuplicate) {
-                    OH_LOG_INFO(LOG_APP, "Discover: found device %{public}s", info.connectKey.c_str());
                     devices.push_back(info);
                 }
             }
@@ -1669,7 +2024,6 @@ std::vector<DeviceInfo> HdcClientWrapper::Discover(int timeoutMs) {
     
     close(sock);
     
-    OH_LOG_INFO(LOG_APP, "Discover: found %{public}zu devices", devices.size());
     SetLastError(static_cast<int>(ErrorCode::SUCCESS));
     return devices;
 }
@@ -1681,6 +2035,48 @@ std::vector<DeviceInfo> HdcClientWrapper::Discover(int timeoutMs) {
 static std::atomic<uint32_t> g_channelIdCounter{1};
 static uint32_t GenerateChannelId() {
     return g_channelIdCounter++;
+}
+
+// Reset channel ID counter (called when reconnecting to a new device)
+static void ResetChannelIdCounter() {
+    g_channelIdCounter = 1;
+}
+
+// Cleanup forward tasks and list (called during disconnect/cleanup)
+// NOTE: This function should NOT call uv_close directly as it may be called from non-event-loop thread
+// The TCP handles will be cleaned up when the connection is closed
+static void CleanupForwardTasks() {
+    // Cleanup forward tasks - only delete the task structures, not the uv handles
+    // The uv handles are associated with the connection and will be cleaned up separately
+    {
+        std::lock_guard<std::mutex> lock(g_forwardTasksMutex);
+        for (auto& pair : g_forwardTasks) {
+            ForwardTask* task = pair.second;
+            if (task) {
+                // Mark listener as inactive - don't call uv_close here as we may not be in event loop thread
+                task->listenerActive = false;
+                // Cleanup contexts - just delete the structures
+                for (auto& ctxPair : task->contexts) {
+                    if (ctxPair.second) {
+                        ctxPair.second->finished = true;
+                        delete ctxPair.second;
+                    }
+                }
+                task->contexts.clear();
+                delete task;
+            }
+        }
+        g_forwardTasks.clear();
+    }
+    
+    // Cleanup forward list
+    {
+        std::lock_guard<std::mutex> lock(g_forwardListMutex);
+        g_forwardList.clear();
+    }
+    
+    // Reset channel ID counter for new connection
+    ResetChannelIdCounter();
 }
 
 // Helper function to send command and wait for response
@@ -1700,8 +2096,8 @@ static CommandResult SendCommandAndWait(const std::string& command, uint16_t cmd
     // Generate unique channel ID for this command
     uint32_t channelId = GenerateChannelId();
     
-    OH_LOG_INFO(LOG_APP, "Sending command (type=%{public}d, channelId=%{public}u): %{public}s", 
-                cmdType, channelId, command.c_str());
+    OH_LOG_INFO(LOG_APP, "SendCommand: cmd=%{public}s, type=%{public}u, channelId=%{public}u", 
+                command.c_str(), cmdType, channelId);
     
     // Clear response buffer
     {
@@ -1716,6 +2112,7 @@ static CommandResult SendCommandAndWait(const std::string& command, uint16_t cmd
                               command.size() + 1);  // include null terminator
     
     if (!sent) {
+        OH_LOG_ERROR(LOG_APP, "SendCommand: failed to send packet");
         result.code = static_cast<int>(ErrorCode::ERR_PROTOCOL_ERROR);
         result.output = "[Fail]Failed to send command";
         return result;
@@ -1731,7 +2128,6 @@ static CommandResult SendCommandAndWait(const std::string& command, uint16_t cmd
         auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - startTime).count();
         if (elapsed >= timeoutMs) {
-            OH_LOG_WARN(LOG_APP, "Command timeout after %{public}lld ms", elapsed);
             if (outputBuffer.empty()) {
                 result.code = static_cast<int>(ErrorCode::ERR_CONNECTION_TIMEOUT);
                 result.output = "[Fail]Command timeout";
@@ -1743,7 +2139,7 @@ static CommandResult SendCommandAndWait(const std::string& command, uint16_t cmd
         
         // Wait for response with shorter intervals to be more responsive
         std::unique_lock<std::mutex> lock(g_connState->mutex);
-        int waitTime = std::min(100, timeoutMs - static_cast<int>(elapsed));  // Wait max 100ms at a time
+        int waitTime = std::min(100, timeoutMs - static_cast<int>(elapsed));
         bool hasData = g_connState->cv.wait_for(lock, std::chrono::milliseconds(waitTime),
                                                  [&]() { return !g_connState->responseBuffer.empty() || 
                                                                 g_connState->lastError.load() != 0; });
@@ -1765,7 +2161,6 @@ static CommandResult SendCommandAndWait(const std::string& command, uint16_t cmd
             
             // Verify packet flag
             if (respHead->flag[0] != PACKET_FLAG_STR[0] || respHead->flag[1] != PACKET_FLAG_STR[1]) {
-                OH_LOG_ERROR(LOG_APP, "Invalid packet flag in response");
                 g_connState->responseBuffer.clear();
                 break;
             }
@@ -1784,20 +2179,14 @@ static CommandResult SendCommandAndWait(const std::string& command, uint16_t cmd
             std::string protectStr(data + sizeof(PayloadHead), headSize);
             Hdc::SerialStruct::ParseFromString(protectBuf, protectStr);
             
-            OH_LOG_INFO(LOG_APP, "Response packet: cmd=%{public}u, channelId=%{public}u, dataSize=%{public}u",
-                        protectBuf.commandFlag, protectBuf.channelId, dataSize);
-            
             // Handle CMD_KERNEL_CHANNEL_CLOSE first - this indicates command completion
             if (protectBuf.commandFlag == CMD_KERNEL_CHANNEL_CLOSE) {
-                OH_LOG_INFO(LOG_APP, "Channel closed (cmd=2), command completed");
                 channelClosed = true;
-                // Remove this packet from buffer
                 g_connState->responseBuffer.erase(0, totalPacketSize);
-                break;  // Exit packet processing loop
+                break;
             }
             
             // Handle output response types
-            // CMD_KERNEL_ECHO (9), CMD_KERNEL_ECHO_RAW (10), CMD_SHELL_DATA (2001) all contain output
             if (protectBuf.commandFlag == CMD_KERNEL_ECHO ||
                 protectBuf.commandFlag == CMD_KERNEL_ECHO_RAW || 
                 protectBuf.commandFlag == CMD_SHELL_DATA) {
@@ -1805,16 +2194,7 @@ static CommandResult SendCommandAndWait(const std::string& command, uint16_t cmd
                 if (dataSize > 0) {
                     std::string chunk(data + sizeof(PayloadHead) + headSize, dataSize);
                     
-                    // Log raw bytes for debugging (first 64 bytes)
-                    std::string hexDump;
-                    for (size_t i = 0; i < std::min(chunk.size(), (size_t)64); i++) {
-                        char hex[4];
-                        snprintf(hex, sizeof(hex), "%02x ", (unsigned char)chunk[i]);
-                        hexDump += hex;
-                    }
-                    OH_LOG_INFO(LOG_APP, "Raw output bytes: %{public}s", hexDump.c_str());
-                    
-                    // Remove leading nulls (daemon sometimes prepends \0 to messages)
+                    // Remove leading nulls
                     size_t startPos = 0;
                     while (startPos < chunk.size() && chunk[startPos] == '\0') {
                         startPos++;
@@ -1828,16 +2208,12 @@ static CommandResult SendCommandAndWait(const std::string& command, uint16_t cmd
                         chunk.pop_back();
                     }
                     outputBuffer += chunk;
-                    OH_LOG_INFO(LOG_APP, "Received output (cmd=%{public}u): %{public}zu bytes, content: [%{public}s]", 
-                                protectBuf.commandFlag, chunk.size(), chunk.c_str());
                 }
-                // Remove processed packet from buffer
                 g_connState->responseBuffer.erase(0, totalPacketSize);
-                continue;  // Continue processing more packets
+                continue;
             }
             
-            // For other unknown commands, log and remove
-            OH_LOG_WARN(LOG_APP, "Unexpected response cmd=%{public}u, removing from buffer", protectBuf.commandFlag);
+            // For other unknown commands, remove from buffer
             g_connState->responseBuffer.erase(0, totalPacketSize);
         }
     }
@@ -1851,12 +2227,22 @@ static CommandResult SendCommandAndWait(const std::string& command, uint16_t cmd
         result.output.pop_back();
     }
     
-    OH_LOG_INFO(LOG_APP, "Command completed, output length: %{public}zu", result.output.size());
+    OH_LOG_INFO(LOG_APP, "SendCommand: completed, code=%{public}d, output_len=%{public}zu", 
+                result.code, result.output.size());
+    if (!result.output.empty()) {
+        // 截取前200字符显示，避免日志过长
+        std::string displayOutput = result.output.length() > 200 
+            ? result.output.substr(0, 200) + "..." 
+            : result.output;
+        OH_LOG_INFO(LOG_APP, "SendCommand: output=[%{public}s]", displayOutput.c_str());
+    }
     return result;
 }
 
 CommandResult HdcClientWrapper::ExecuteCommand(const std::string& command, const std::string& connId) {
     CommandResult result = {0, ""};
+    
+    OH_LOG_INFO(LOG_APP, "ExecuteCommand: %{public}s", command.c_str());
     
     if (!initialized_) {
         result.code = static_cast<int>(ErrorCode::ERR_NOT_INITIALIZED);
@@ -1891,8 +2277,53 @@ CommandResult HdcClientWrapper::ExecuteCommand(const std::string& command, const
         cmdType = CMD_JDWP_LIST;
     } else if (command.find("bugreport") == 0) {
         cmdType = CMD_UNITY_BUGREPORT_INIT;
-    } else if (command.find("fport") == 0 || command.find("rport") == 0) {
-        cmdType = CMD_FORWARD_INIT;
+    } else if (command.find("fport") == 0) {
+        // Handle fport commands using our Forward implementation
+        if (command == "fport ls" || command == "fport list") {
+            // List all forwards
+            return ForwardList(connId);
+        } else if (command.find("fport rm ") == 0) {
+            // Remove forward: "fport rm <local> <remote>"
+            std::string args = command.substr(9);  // Remove "fport rm "
+            size_t spacePos = args.find(' ');
+            if (spacePos != std::string::npos) {
+                std::string localPort = args.substr(0, spacePos);
+                std::string remotePort = args.substr(spacePos + 1);
+                int ret = ForwardRemove(localPort, remotePort, connId);
+                result.code = ret;
+                result.output = (ret == 0) ? "[Success]Forward removed" : GetErrorMessage(ret);
+                return result;
+            } else {
+                result.code = static_cast<int>(ErrorCode::ERR_INVALID_COMMAND);
+                result.output = "[Fail]Usage: fport rm <local> <remote>";
+                return result;
+            }
+        } else if (command.find("fport ") == 0) {
+            // Create forward: "fport <local> <remote>"
+            std::string args = command.substr(6);  // Remove "fport "
+            size_t spacePos = args.find(' ');
+            if (spacePos != std::string::npos) {
+                std::string localPort = args.substr(0, spacePos);
+                std::string remotePort = args.substr(spacePos + 1);
+                int ret = Forward(localPort, remotePort, connId);
+                result.code = ret;
+                result.output = (ret == 0) ? "[Success]Forward established" : GetErrorMessage(ret);
+                return result;
+            } else {
+                result.code = static_cast<int>(ErrorCode::ERR_INVALID_COMMAND);
+                result.output = "[Fail]Usage: fport <local> <remote>";
+                return result;
+            }
+        } else {
+            result.code = static_cast<int>(ErrorCode::ERR_INVALID_COMMAND);
+            result.output = "[Fail]Unknown fport command. Usage: fport <local> <remote>, fport ls, fport rm <local> <remote>";
+            return result;
+        }
+    } else if (command.find("rport") == 0) {
+        // Reverse forward not yet implemented
+        result.code = static_cast<int>(ErrorCode::ERR_FORWARD_FAILED);
+        result.output = "[Fail]Reverse forward (rport) not yet implemented";
+        return result;
     } else if (command.find("file send") == 0 || command.find("file recv") == 0) {
         cmdType = CMD_FILE_INIT;
     } else if (command.find("install") == 0 || command.find("sideload") == 0) {
@@ -1902,12 +2333,20 @@ CommandResult HdcClientWrapper::ExecuteCommand(const std::string& command, const
     }
     
     result = SendCommandAndWait(actualCommand, cmdType);
+    OH_LOG_INFO(LOG_APP, "ExecuteCommand: result code=%{public}d", result.code);
     SetLastError(result.code);
     return result;
 }
 
+CommandResult HdcClientWrapper::Execute(const std::string& command) {
+    // 通用 hdc 命令执行接口，直接调用 ExecuteCommand
+    return ExecuteCommand(command, "");
+}
+
 CommandResult HdcClientWrapper::Shell(const std::string& command, const std::string& connId) {
     CommandResult result = {0, ""};
+    
+    OH_LOG_INFO(LOG_APP, "Shell: %{public}s", command.c_str());
     
     if (!initialized_) {
         result.code = static_cast<int>(ErrorCode::ERR_NOT_INITIALIZED);
@@ -1928,6 +2367,7 @@ CommandResult HdcClientWrapper::Shell(const std::string& command, const std::str
     
     // Use CMD_UNITY_EXECUTE for executing shell commands
     result = SendCommandAndWait(command, CMD_UNITY_EXECUTE);
+    OH_LOG_INFO(LOG_APP, "Shell: result code=%{public}d", result.code);
     SetLastError(result.code);
     return result;
 }
@@ -2116,22 +2556,15 @@ static bool SendFileDataBlock(uint32_t channelId, uint64_t index,
 
 int HdcClientWrapper::FileSend(const std::string& localPath, const std::string& remotePath,
                                const std::string& connId) {
-    if (!initialized_) {
-        SetLastError(static_cast<int>(ErrorCode::ERR_NOT_INITIALIZED));
-        return static_cast<int>(ErrorCode::ERR_NOT_INITIALIZED);
-    }
-    
-    if (g_connState == nullptr || !g_connState->handshakeOK.load()) {
-        SetLastError(static_cast<int>(ErrorCode::ERR_CONNECTION_CLOSED));
-        return static_cast<int>(ErrorCode::ERR_CONNECTION_CLOSED);
-    }
+    CHECK_INITIALIZED_RETURN(static_cast<int>(ErrorCode::ERR_NOT_INITIALIZED));
+    CHECK_CONNECTION_RETURN(static_cast<int>(ErrorCode::ERR_CONNECTION_CLOSED));
     
     OH_LOG_INFO(LOG_APP, "FileSend: %{public}s -> %{public}s", localPath.c_str(), remotePath.c_str());
     
     // Check if local file exists
     int64_t fileSize = GetFileSize(localPath);
     if (fileSize < 0) {
-        OH_LOG_ERROR(LOG_APP, "FileSend: local file not found: %{public}s", localPath.c_str());
+        OH_LOG_ERROR(LOG_APP, "FileSend: file not found");
         SetLastError(static_cast<int>(ErrorCode::ERR_FILE_NOT_FOUND));
         return static_cast<int>(ErrorCode::ERR_FILE_NOT_FOUND);
     }
@@ -2139,7 +2572,6 @@ int HdcClientWrapper::FileSend(const std::string& localPath, const std::string& 
     // Open local file
     std::ifstream file(localPath, std::ios::binary);
     if (!file.is_open()) {
-        OH_LOG_ERROR(LOG_APP, "FileSend: failed to open file: %{public}s", localPath.c_str());
         SetLastError(static_cast<int>(ErrorCode::ERR_FILE_NOT_FOUND));
         return static_cast<int>(ErrorCode::ERR_FILE_NOT_FOUND);
     }
@@ -2156,7 +2588,6 @@ int HdcClientWrapper::FileSend(const std::string& localPath, const std::string& 
     std::string initCmd = localPath + " " + remotePath;
     auto initResult = SendCommandAndWait(initCmd, CMD_FILE_INIT, FILE_TRANSFER_TIMEOUT_MS);
     if (initResult.code != static_cast<int>(ErrorCode::SUCCESS)) {
-        OH_LOG_ERROR(LOG_APP, "FileSend: CMD_FILE_INIT failed: %{public}d", initResult.code);
         file.close();
         SetLastError(initResult.code);
         return initResult.code;
@@ -2179,7 +2610,6 @@ int HdcClientWrapper::FileSend(const std::string& localPath, const std::string& 
         
         // Send data block with LZ4 compression
         if (!SendFileDataBlock(g_connState->channelId.load(), index, buffer.data(), bytesRead, true)) {
-            OH_LOG_ERROR(LOG_APP, "FileSend: failed to send data block at index %{public}lu", static_cast<unsigned long>(index));
             file.close();
             SetLastError(static_cast<int>(ErrorCode::ERR_FILE_TRANSFER_FAILED));
             return static_cast<int>(ErrorCode::ERR_FILE_TRANSFER_FAILED);
@@ -2256,22 +2686,14 @@ static bool ProcessFileData(const uint8_t* data, size_t dataSize) {
 
 int HdcClientWrapper::FileRecv(const std::string& remotePath, const std::string& localPath,
                                const std::string& connId) {
-    if (!initialized_) {
-        SetLastError(static_cast<int>(ErrorCode::ERR_NOT_INITIALIZED));
-        return static_cast<int>(ErrorCode::ERR_NOT_INITIALIZED);
-    }
-    
-    if (g_connState == nullptr || !g_connState->handshakeOK.load()) {
-        SetLastError(static_cast<int>(ErrorCode::ERR_CONNECTION_CLOSED));
-        return static_cast<int>(ErrorCode::ERR_CONNECTION_CLOSED);
-    }
+    CHECK_INITIALIZED_RETURN(static_cast<int>(ErrorCode::ERR_NOT_INITIALIZED));
+    CHECK_CONNECTION_RETURN(static_cast<int>(ErrorCode::ERR_CONNECTION_CLOSED));
     
     OH_LOG_INFO(LOG_APP, "FileRecv: %{public}s -> %{public}s", remotePath.c_str(), localPath.c_str());
     
     // Create/open local file for writing
     std::ofstream file(localPath, std::ios::binary | std::ios::trunc);
     if (!file.is_open()) {
-        OH_LOG_ERROR(LOG_APP, "FileRecv: failed to create local file: %{public}s", localPath.c_str());
         SetLastError(static_cast<int>(ErrorCode::ERR_PERMISSION_DENIED));
         return static_cast<int>(ErrorCode::ERR_PERMISSION_DENIED);
     }
@@ -2290,7 +2712,6 @@ int HdcClientWrapper::FileRecv(const std::string& remotePath, const std::string&
     auto initResult = SendCommandAndWait(initCmd, CMD_FILE_INIT, FILE_TRANSFER_TIMEOUT_MS);
     
     if (initResult.code != static_cast<int>(ErrorCode::SUCCESS)) {
-        OH_LOG_ERROR(LOG_APP, "FileRecv: CMD_FILE_INIT failed: %{public}d", initResult.code);
         g_fileRecvState->file.close();
         delete g_fileRecvState;
         g_fileRecvState = nullptr;
@@ -2310,7 +2731,7 @@ int HdcClientWrapper::FileRecv(const std::string& remotePath, const std::string&
     uint64_t totalReceived = g_fileRecvState->totalReceived.load();
     
     if (!success) {
-        OH_LOG_ERROR(LOG_APP, "FileRecv: timeout waiting for file data");
+        OH_LOG_ERROR(LOG_APP, "FileRecv: timeout");
         result = static_cast<int>(ErrorCode::ERR_CONNECTION_TIMEOUT);
     } else if (g_fileRecvState->errorCode.load() != 0) {
         result = g_fileRecvState->errorCode.load();
@@ -2321,10 +2742,8 @@ int HdcClientWrapper::FileRecv(const std::string& remotePath, const std::string&
     delete g_fileRecvState;
     g_fileRecvState = nullptr;
     
-    if (result == static_cast<int>(ErrorCode::SUCCESS)) {
-        OH_LOG_INFO(LOG_APP, "FileRecv: completed, received %{public}lu bytes", static_cast<unsigned long>(totalReceived));
-    }
-    
+    OH_LOG_INFO(LOG_APP, "FileRecv: completed, code=%{public}d, received=%{public}lu bytes", 
+                result, static_cast<unsigned long>(totalReceived));
     SetLastError(result);
     return result;
 }
@@ -2336,54 +2755,26 @@ static const int APP_INSTALL_TIMEOUT_MS = 120000;  // 2 minutes
 CommandResult HdcClientWrapper::Install(const std::string& hapPath, const std::string& options,
                                         const std::string& connId) {
     CommandResult result = {0, ""};
+    CHECK_INITIALIZED_RESULT();
+    CHECK_CONNECTION_RESULT();
     
-    if (!initialized_) {
-        result.code = static_cast<int>(ErrorCode::ERR_NOT_INITIALIZED);
-        result.output = GetErrorMessage(result.code);
-        SetLastError(result.code);
-        return result;
-    }
-    
-    if (g_connState == nullptr || !g_connState->handshakeOK.load()) {
-        result.code = static_cast<int>(ErrorCode::ERR_CONNECTION_CLOSED);
-        result.output = GetErrorMessage(result.code);
-        SetLastError(result.code);
-        return result;
-    }
-    
-    OH_LOG_INFO(LOG_APP, "Install: %{public}s options=%{public}s", hapPath.c_str(), options.c_str());
+    OH_LOG_INFO(LOG_APP, "Install: %{public}s, options=%{public}s", hapPath.c_str(), options.c_str());
     
     // Check if local HAP file exists
     int64_t fileSize = GetFileSize(hapPath);
     if (fileSize < 0) {
-        OH_LOG_ERROR(LOG_APP, "Install: HAP file not found: %{public}s", hapPath.c_str());
+        OH_LOG_ERROR(LOG_APP, "Install: HAP file not found");
         result.code = static_cast<int>(ErrorCode::ERR_FILE_NOT_FOUND);
         result.output = "[Fail]HAP file not found: " + hapPath;
         SetLastError(result.code);
         return result;
     }
     
-    // Extract filename from path
-    std::string filename = hapPath;
-    size_t pos = hapPath.find_last_of("/\\");
-    if (pos != std::string::npos) {
-        filename = hapPath.substr(pos + 1);
-    }
-    
     // Step 1: Send CMD_APP_INIT with install command
-    // Format: "install [options] hapPath" (matching original hdc)
     std::string initCmd = options.empty() ? hapPath : (options + " " + hapPath);
     result = SendCommandAndWait(initCmd, CMD_APP_INIT, APP_INSTALL_TIMEOUT_MS);
     
-    if (result.code != static_cast<int>(ErrorCode::SUCCESS)) {
-        OH_LOG_ERROR(LOG_APP, "Install: CMD_APP_INIT failed: %{public}d", result.code);
-        SetLastError(result.code);
-        return result;
-    }
-    
-    // The device will handle the file transfer and installation
-    // Wait for the final result
-    OH_LOG_INFO(LOG_APP, "Install: completed with result: %{public}s", result.output.c_str());
+    OH_LOG_INFO(LOG_APP, "Install: completed, code=%{public}d", result.code);
     SetLastError(result.code);
     return result;
 }
@@ -2391,24 +2782,12 @@ CommandResult HdcClientWrapper::Install(const std::string& hapPath, const std::s
 CommandResult HdcClientWrapper::Uninstall(const std::string& packageName, const std::string& options,
                                           const std::string& connId) {
     CommandResult result = {0, ""};
+    CHECK_INITIALIZED_RESULT();
+    CHECK_CONNECTION_RESULT();
     
-    if (!initialized_) {
-        result.code = static_cast<int>(ErrorCode::ERR_NOT_INITIALIZED);
-        result.output = GetErrorMessage(result.code);
-        SetLastError(result.code);
-        return result;
-    }
+    OH_LOG_INFO(LOG_APP, "Uninstall: %{public}s, options=%{public}s", packageName.c_str(), options.c_str());
     
-    if (g_connState == nullptr || !g_connState->handshakeOK.load()) {
-        result.code = static_cast<int>(ErrorCode::ERR_CONNECTION_CLOSED);
-        result.output = GetErrorMessage(result.code);
-        SetLastError(result.code);
-        return result;
-    }
-    
-    OH_LOG_INFO(LOG_APP, "Uninstall: %{public}s options=%{public}s", packageName.c_str(), options.c_str());
-    
-    // Validate package name format (basic check)
+    // Validate package name format
     if (packageName.empty()) {
         result.code = static_cast<int>(ErrorCode::ERR_INVALID_COMMAND);
         result.output = "[Fail]Package name is empty";
@@ -2417,38 +2796,25 @@ CommandResult HdcClientWrapper::Uninstall(const std::string& packageName, const 
     }
     
     // Send CMD_APP_UNINSTALL
-    // Format: "uninstall [options] packageName" (matching original hdc)
     std::string cmd = options.empty() ? packageName : (options + " " + packageName);
     result = SendCommandAndWait(cmd, CMD_APP_UNINSTALL, APP_INSTALL_TIMEOUT_MS);
     
-    OH_LOG_INFO(LOG_APP, "Uninstall: completed with result: %{public}s", result.output.c_str());
+    OH_LOG_INFO(LOG_APP, "Uninstall: completed, code=%{public}d", result.code);
     SetLastError(result.code);
     return result;
 }
 
 CommandResult HdcClientWrapper::Sideload(const std::string& packagePath, const std::string& connId) {
     CommandResult result = {0, ""};
-    
-    if (!initialized_) {
-        result.code = static_cast<int>(ErrorCode::ERR_NOT_INITIALIZED);
-        result.output = GetErrorMessage(result.code);
-        SetLastError(result.code);
-        return result;
-    }
-    
-    if (g_connState == nullptr || !g_connState->handshakeOK.load()) {
-        result.code = static_cast<int>(ErrorCode::ERR_CONNECTION_CLOSED);
-        result.output = GetErrorMessage(result.code);
-        SetLastError(result.code);
-        return result;
-    }
+    CHECK_INITIALIZED_RESULT();
+    CHECK_CONNECTION_RESULT();
     
     OH_LOG_INFO(LOG_APP, "Sideload: %{public}s", packagePath.c_str());
     
     // Check if package file exists
     int64_t fileSize = GetFileSize(packagePath);
     if (fileSize < 0) {
-        OH_LOG_ERROR(LOG_APP, "Sideload: package file not found: %{public}s", packagePath.c_str());
+        OH_LOG_ERROR(LOG_APP, "Sideload: file not found");
         result.code = static_cast<int>(ErrorCode::ERR_FILE_NOT_FOUND);
         result.output = "[Fail]Package file not found: " + packagePath;
         SetLastError(result.code);
@@ -2456,28 +2822,20 @@ CommandResult HdcClientWrapper::Sideload(const std::string& packagePath, const s
     }
     
     // Sideload uses CMD_APP_SIDELOAD (3005) for OTA-style updates
-    // This is different from regular install
     result = SendCommandAndWait(packagePath, CMD_APP_SIDELOAD, APP_INSTALL_TIMEOUT_MS);
     
-    OH_LOG_INFO(LOG_APP, "Sideload: completed with result: %{public}s", result.output.c_str());
+    OH_LOG_INFO(LOG_APP, "Sideload: completed, code=%{public}d", result.code);
     SetLastError(result.code);
     return result;
 }
 
 // Port forwarding
-// Supported forward types: tcp, localabstract, localfilesystem, jdwp, ark
+// Supported forward types: tcp (other types like jdwp, ark require additional implementation)
 
 int HdcClientWrapper::Forward(const std::string& localPort, const std::string& remotePort,
                               const std::string& connId) {
-    if (!initialized_) {
-        SetLastError(static_cast<int>(ErrorCode::ERR_NOT_INITIALIZED));
-        return static_cast<int>(ErrorCode::ERR_NOT_INITIALIZED);
-    }
-    
-    if (g_connState == nullptr || !g_connState->handshakeOK.load()) {
-        SetLastError(static_cast<int>(ErrorCode::ERR_CONNECTION_CLOSED));
-        return static_cast<int>(ErrorCode::ERR_CONNECTION_CLOSED);
-    }
+    CHECK_INITIALIZED_RETURN(static_cast<int>(ErrorCode::ERR_NOT_INITIALIZED));
+    CHECK_CONNECTION_RETURN(static_cast<int>(ErrorCode::ERR_CONNECTION_CLOSED));
     
     OH_LOG_INFO(LOG_APP, "Forward: %{public}s -> %{public}s", localPort.c_str(), remotePort.c_str());
     
@@ -2488,12 +2846,6 @@ int HdcClientWrapper::Forward(const std::string& localPort, const std::string& r
     }
     
     // Build forward command
-    // Format: "localSpec remoteSpec" where spec can be:
-    // - tcp:port
-    // - localabstract:name
-    // - localfilesystem:path
-    // - jdwp:pid
-    // - ark:pid
     std::string localSpec = localPort;
     std::string remoteSpec = remotePort;
     
@@ -2505,65 +2857,261 @@ int HdcClientWrapper::Forward(const std::string& localPort, const std::string& r
         remoteSpec = "tcp:" + remoteSpec;
     }
     
-    std::string cmd = localSpec + " " + remoteSpec;
-    auto result = SendCommandAndWait(cmd, CMD_FORWARD_INIT);
-    
-    if (result.code == static_cast<int>(ErrorCode::SUCCESS)) {
-        OH_LOG_INFO(LOG_APP, "Forward: established %{public}s -> %{public}s", localSpec.c_str(), remoteSpec.c_str());
-    } else {
-        OH_LOG_ERROR(LOG_APP, "Forward: failed with code %{public}d", result.code);
-    }
-    
-    SetLastError(result.code);
-    return result.code;
-}
-
-int HdcClientWrapper::Reverse(const std::string& remotePort, const std::string& localPort,
-                              const std::string& connId) {
-    if (!initialized_) {
-        SetLastError(static_cast<int>(ErrorCode::ERR_NOT_INITIALIZED));
-        return static_cast<int>(ErrorCode::ERR_NOT_INITIALIZED);
-    }
-    
-    if (g_connState == nullptr || !g_connState->handshakeOK.load()) {
-        SetLastError(static_cast<int>(ErrorCode::ERR_CONNECTION_CLOSED));
-        return static_cast<int>(ErrorCode::ERR_CONNECTION_CLOSED);
-    }
-    
-    OH_LOG_INFO(LOG_APP, "Reverse: %{public}s -> %{public}s", remotePort.c_str(), localPort.c_str());
-    
-    // Validate port format
-    if (remotePort.empty() || localPort.empty()) {
+    // Parse local port
+    std::string localType;
+    int localPortNum = 0;
+    if (!ParsePortSpec(localSpec, localType, localPortNum)) {
+        OH_LOG_ERROR(LOG_APP, "Forward: invalid local port spec: %{public}s", localSpec.c_str());
         SetLastError(static_cast<int>(ErrorCode::ERR_INVALID_COMMAND));
         return static_cast<int>(ErrorCode::ERR_INVALID_COMMAND);
     }
     
-    // Build reverse forward command
-    // Reverse is similar to forward but direction is from device to host
-    std::string remoteSpec = remotePort;
+    // Only TCP is supported for now
+    if (localType != "tcp") {
+        OH_LOG_ERROR(LOG_APP, "Forward: only tcp type is supported, got: %{public}s", localType.c_str());
+        SetLastError(static_cast<int>(ErrorCode::ERR_INVALID_COMMAND));
+        return static_cast<int>(ErrorCode::ERR_INVALID_COMMAND);
+    }
+    
+    // Get channel ID for this forward
+    uint32_t channelId = g_connState->channelId.fetch_add(1);
+    
+    // Create forward task
+    ForwardTask* task = new ForwardTask();
+    task->channelId = channelId;
+    task->localSpec = localSpec;
+    task->remoteSpec = remoteSpec;
+    task->localPort = localPortNum;
+    task->isReverse = false;
+    task->established = false;
+    task->failed = false;
+    task->listenerActive = false;
+    
+    // Add to global task map
+    {
+        std::lock_guard<std::mutex> lock(g_forwardTasksMutex);
+        g_forwardTasks[channelId] = task;
+    }
+    
+    // Initialize TCP listener
+    uv_tcp_init(loop_, &task->listenHandle);
+    task->listenHandle.data = task;
+    
+    // Bind to local port
+    struct sockaddr_in addr;
+    uv_ip4_addr("127.0.0.1", localPortNum, &addr);
+    
+    int bindResult = uv_tcp_bind(&task->listenHandle, (const struct sockaddr*)&addr, 0);
+    if (bindResult != 0) {
+        OH_LOG_ERROR(LOG_APP, "Forward: failed to bind to port %{public}d: %{public}s", 
+                    localPortNum, uv_strerror(bindResult));
+        
+        // Cleanup
+        {
+            std::lock_guard<std::mutex> lock(g_forwardTasksMutex);
+            g_forwardTasks.erase(channelId);
+        }
+        delete task;
+        
+        SetLastError(static_cast<int>(ErrorCode::ERR_PORT_IN_USE));
+        return static_cast<int>(ErrorCode::ERR_PORT_IN_USE);
+    }
+    
+    // Start listening
+    int listenResult = uv_listen((uv_stream_t*)&task->listenHandle, 128, ForwardListenCallback);
+    if (listenResult != 0) {
+        OH_LOG_ERROR(LOG_APP, "Forward: failed to listen on port %{public}d: %{public}s", 
+                    localPortNum, uv_strerror(listenResult));
+        
+        uv_close((uv_handle_t*)&task->listenHandle, nullptr);
+        {
+            std::lock_guard<std::mutex> lock(g_forwardTasksMutex);
+            g_forwardTasks.erase(channelId);
+        }
+        delete task;
+        
+        SetLastError(static_cast<int>(ErrorCode::ERR_FORWARD_FAILED));
+        return static_cast<int>(ErrorCode::ERR_FORWARD_FAILED);
+    }
+    
+    task->listenerActive = true;
+    
+    // Send CMD_FORWARD_INIT to daemon
+    std::string cmd = localSpec + " " + remoteSpec;
+    bool sendResult = SendHdcPacket(g_connState, channelId, CMD_FORWARD_INIT, 
+                  reinterpret_cast<const uint8_t*>(cmd.c_str()), cmd.length());
+    if (!sendResult) {
+        OH_LOG_ERROR(LOG_APP, "Forward: failed to send CMD_FORWARD_INIT");
+    }
+    
+    // Wait for forward to be established (with timeout)
+    {
+        std::unique_lock<std::mutex> lock(task->mutex);
+        bool success = task->cv.wait_for(lock, std::chrono::milliseconds(CMD_TIMEOUT_MS), [task]() {
+            return task->established || task->failed;
+        });
+        
+        if (!success) {
+            OH_LOG_ERROR(LOG_APP, "Forward: timeout waiting for establishment (no CMD_FORWARD_SUCCESS received)");
+            task->failed = true;
+            task->errorMessage = "Timeout waiting for CMD_FORWARD_SUCCESS";
+        }
+    }
+    
+    if (task->failed) {
+        OH_LOG_ERROR(LOG_APP, "Forward: failed - %{public}s", task->errorMessage.c_str());
+        
+        // Cleanup listener
+        if (task->listenerActive) {
+            uv_close((uv_handle_t*)&task->listenHandle, nullptr);
+        }
+        
+        {
+            std::lock_guard<std::mutex> lock(g_forwardTasksMutex);
+            g_forwardTasks.erase(channelId);
+        }
+        delete task;
+        
+        SetLastError(static_cast<int>(ErrorCode::ERR_FORWARD_FAILED));
+        return static_cast<int>(ErrorCode::ERR_FORWARD_FAILED);
+    }
+    
+    // Add to forward list
+    {
+        std::lock_guard<std::mutex> lock(g_forwardListMutex);
+        ForwardInfo info;
+        info.localSpec = localSpec;
+        info.remoteSpec = remoteSpec;
+        info.isReverse = false;
+        info.channelId = channelId;
+        g_forwardList.push_back(info);
+    }
+    
+    OH_LOG_INFO(LOG_APP, "Forward: established %{public}s -> %{public}s", localSpec.c_str(), remoteSpec.c_str());
+    SetLastError(static_cast<int>(ErrorCode::SUCCESS));
+    return static_cast<int>(ErrorCode::SUCCESS);
+}
+
+int HdcClientWrapper::Reverse(const std::string& remotePort, const std::string& localPort,
+                              const std::string& connId) {
+    // Reverse forward is not yet implemented
+    // It requires the daemon to initiate connections to the host
+    OH_LOG_WARN(LOG_APP, "Reverse: not yet implemented");
+    SetLastError(static_cast<int>(ErrorCode::ERR_FORWARD_FAILED));
+    return static_cast<int>(ErrorCode::ERR_FORWARD_FAILED);
+}
+
+CommandResult HdcClientWrapper::ForwardList(const std::string& connId) {
+    CommandResult result = {0, ""};
+    CHECK_INITIALIZED_RESULT();
+    
+    std::lock_guard<std::mutex> lock(g_forwardListMutex);
+    
+    if (g_forwardList.empty()) {
+        result.output = "[Empty]";
+    } else {
+        std::string output;
+        for (const auto& fwd : g_forwardList) {
+            output += fwd.localSpec + " " + fwd.remoteSpec;
+            output += fwd.isReverse ? " [Reverse]\n" : " [Forward]\n";
+        }
+        // Remove trailing newline
+        if (!output.empty() && output.back() == '\n') {
+            output.pop_back();
+        }
+        result.output = output;
+    }
+    
+    result.code = static_cast<int>(ErrorCode::SUCCESS);
+    SetLastError(result.code);
+    return result;
+}
+
+int HdcClientWrapper::ForwardRemove(const std::string& localPort, const std::string& remotePort,
+                                    const std::string& connId) {
+    CHECK_INITIALIZED_RETURN(static_cast<int>(ErrorCode::ERR_NOT_INITIALIZED));
+    
+    OH_LOG_INFO(LOG_APP, "ForwardRemove: %{public}s %{public}s", localPort.c_str(), remotePort.c_str());
+    
     std::string localSpec = localPort;
+    std::string remoteSpec = remotePort;
     
     // Add tcp: prefix if not already specified
-    if (remoteSpec.find(':') == std::string::npos) {
-        remoteSpec = "tcp:" + remoteSpec;
-    }
     if (localSpec.find(':') == std::string::npos) {
         localSpec = "tcp:" + localSpec;
     }
-    
-    // For reverse, we send with a special flag or different command format
-    // The format is: "reverse remoteSpec localSpec"
-    std::string cmd = remoteSpec + " " + localSpec;
-    auto result = SendCommandAndWait(cmd, CMD_FORWARD_INIT);
-    
-    if (result.code == static_cast<int>(ErrorCode::SUCCESS)) {
-        OH_LOG_INFO(LOG_APP, "Reverse: established %{public}s -> %{public}s", remoteSpec.c_str(), localSpec.c_str());
-    } else {
-        OH_LOG_ERROR(LOG_APP, "Reverse: failed with code %{public}d", result.code);
+    if (remoteSpec.find(':') == std::string::npos) {
+        remoteSpec = "tcp:" + remoteSpec;
     }
     
-    SetLastError(result.code);
-    return result.code;
+    // Find and remove from forward list
+    uint32_t channelId = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_forwardListMutex);
+        auto it = std::find_if(g_forwardList.begin(), g_forwardList.end(),
+            [&](const ForwardInfo& fwd) {
+                return fwd.localSpec == localSpec && fwd.remoteSpec == remoteSpec;
+            });
+        
+        if (it == g_forwardList.end()) {
+            OH_LOG_WARN(LOG_APP, "ForwardRemove: forward not found");
+            SetLastError(static_cast<int>(ErrorCode::ERR_FORWARD_FAILED));
+            return static_cast<int>(ErrorCode::ERR_FORWARD_FAILED);
+        }
+        
+        channelId = it->channelId;
+        g_forwardList.erase(it);
+    }
+    
+    // Find and cleanup forward task
+    ForwardTask* task = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_forwardTasksMutex);
+        auto it = g_forwardTasks.find(channelId);
+        if (it != g_forwardTasks.end()) {
+            task = it->second;
+            g_forwardTasks.erase(it);
+        }
+    }
+    
+    if (task) {
+        // Close listener
+        if (task->listenerActive && !uv_is_closing((uv_handle_t*)&task->listenHandle)) {
+            uv_close((uv_handle_t*)&task->listenHandle, nullptr);
+        }
+        
+        // Close all contexts
+        std::vector<ForwardContext*> contextsToClose;
+        {
+            std::lock_guard<std::mutex> lock(task->mutex);
+            for (auto& pair : task->contexts) {
+                contextsToClose.push_back(pair.second);
+            }
+            task->contexts.clear();
+        }
+        
+        for (auto ctx : contextsToClose) {
+            if (!ctx->finished && !uv_is_closing((uv_handle_t*)&ctx->tcpHandle)) {
+                ctx->finished = true;
+                uv_close((uv_handle_t*)&ctx->tcpHandle, [](uv_handle_t* handle) {
+                    ForwardContext* c = static_cast<ForwardContext*>(handle->data);
+                    delete c;
+                });
+            }
+        }
+        
+        // Send channel close to daemon
+        if (g_connState && g_connState->connected.load()) {
+            uint8_t flag = 0;
+            SendHdcPacket(g_connState, channelId, CMD_KERNEL_CHANNEL_CLOSE, &flag, 1);
+        }
+        
+        delete task;
+    }
+    
+    OH_LOG_INFO(LOG_APP, "ForwardRemove: success");
+    SetLastError(static_cast<int>(ErrorCode::SUCCESS));
+    return static_cast<int>(ErrorCode::SUCCESS);
 }
 
 // Logging and debug
@@ -2573,89 +3121,39 @@ static const int BUGREPORT_TIMEOUT_MS = 180000;  // 3 minutes for bugreport
 
 CommandResult HdcClientWrapper::Hilog(const std::string& args, const std::string& connId) {
     CommandResult result = {0, ""};
-    
-    if (!initialized_) {
-        result.code = static_cast<int>(ErrorCode::ERR_NOT_INITIALIZED);
-        result.output = GetErrorMessage(result.code);
-        SetLastError(result.code);
-        return result;
-    }
-    
-    if (g_connState == nullptr || !g_connState->handshakeOK.load()) {
-        result.code = static_cast<int>(ErrorCode::ERR_CONNECTION_CLOSED);
-        result.output = GetErrorMessage(result.code);
-        SetLastError(result.code);
-        return result;
-    }
+    CHECK_INITIALIZED_RESULT();
+    CHECK_CONNECTION_RESULT();
     
     OH_LOG_INFO(LOG_APP, "Hilog: args=%{public}s", args.c_str());
     
-    // Hilog uses CMD_UNITY_HILOG
-    // Supported args: -h (help), -x (exit), -g (get buffer size), -p <pid>, -t <tag>, etc.
     result = SendCommandAndWait(args, CMD_UNITY_HILOG, HILOG_TIMEOUT_MS);
-    
-    OH_LOG_INFO(LOG_APP, "Hilog: completed with code %{public}d", result.code);
+    OH_LOG_INFO(LOG_APP, "Hilog: completed, code=%{public}d", result.code);
     SetLastError(result.code);
     return result;
 }
 
 CommandResult HdcClientWrapper::Bugreport(const std::string& outputPath, const std::string& connId) {
     CommandResult result = {0, ""};
-    
-    if (!initialized_) {
-        result.code = static_cast<int>(ErrorCode::ERR_NOT_INITIALIZED);
-        result.output = GetErrorMessage(result.code);
-        SetLastError(result.code);
-        return result;
-    }
-    
-    if (g_connState == nullptr || !g_connState->handshakeOK.load()) {
-        result.code = static_cast<int>(ErrorCode::ERR_CONNECTION_CLOSED);
-        result.output = GetErrorMessage(result.code);
-        SetLastError(result.code);
-        return result;
-    }
+    CHECK_INITIALIZED_RESULT();
+    CHECK_CONNECTION_RESULT();
     
     OH_LOG_INFO(LOG_APP, "Bugreport: outputPath=%{public}s", outputPath.c_str());
     
-    // Bugreport uses CMD_UNITY_BUGREPORT_INIT
-    // This collects system logs, crash dumps, and diagnostic information
     result = SendCommandAndWait(outputPath, CMD_UNITY_BUGREPORT_INIT, BUGREPORT_TIMEOUT_MS);
-    
-    if (result.code == static_cast<int>(ErrorCode::SUCCESS)) {
-        OH_LOG_INFO(LOG_APP, "Bugreport: completed successfully");
-    } else {
-        OH_LOG_ERROR(LOG_APP, "Bugreport: failed with code %{public}d", result.code);
-    }
-    
+    OH_LOG_INFO(LOG_APP, "Bugreport: completed, code=%{public}d", result.code);
     SetLastError(result.code);
     return result;
 }
 
 CommandResult HdcClientWrapper::Jpid(const std::string& connId) {
     CommandResult result = {0, ""};
+    CHECK_INITIALIZED_RESULT();
+    CHECK_CONNECTION_RESULT();
     
-    if (!initialized_) {
-        result.code = static_cast<int>(ErrorCode::ERR_NOT_INITIALIZED);
-        result.output = GetErrorMessage(result.code);
-        SetLastError(result.code);
-        return result;
-    }
+    OH_LOG_INFO(LOG_APP, "Jpid: listing debuggable processes");
     
-    if (g_connState == nullptr || !g_connState->handshakeOK.load()) {
-        result.code = static_cast<int>(ErrorCode::ERR_CONNECTION_CLOSED);
-        result.output = GetErrorMessage(result.code);
-        SetLastError(result.code);
-        return result;
-    }
-    
-    OH_LOG_INFO(LOG_APP, "Jpid: listing Java/ArkTS process IDs");
-    
-    // Jpid uses CMD_JDWP_LIST
-    // Returns list of debuggable process IDs (JDWP/ArkTS debug)
     result = SendCommandAndWait("", CMD_JDWP_LIST);
-    
-    OH_LOG_INFO(LOG_APP, "Jpid: completed with code %{public}d", result.code);
+    OH_LOG_INFO(LOG_APP, "Jpid: completed, code=%{public}d", result.code);
     SetLastError(result.code);
     return result;
 }
@@ -2663,12 +3161,7 @@ CommandResult HdcClientWrapper::Jpid(const std::string& connId) {
 // Key management
 
 int HdcClientWrapper::Keygen(const std::string& keyPath) {
-    if (!initialized_) {
-        SetLastError(static_cast<int>(ErrorCode::ERR_NOT_INITIALIZED));
-        return static_cast<int>(ErrorCode::ERR_NOT_INITIALIZED);
-    }
-    
-    OH_LOG_INFO(LOG_APP, "Keygen: %{public}s", keyPath.c_str());
+    CHECK_INITIALIZED_RETURN(static_cast<int>(ErrorCode::ERR_NOT_INITIALIZED));
     
     // TODO: Implement key generation using HdcAuth
     SetLastError(static_cast<int>(ErrorCode::SUCCESS));

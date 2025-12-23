@@ -98,6 +98,7 @@ public:
     
     // Command execution
     CommandResult ExecuteCommand(const std::string& command, const std::string& connId = "");
+    CommandResult Execute(const std::string& command);  // 通用 hdc 命令执行接口
     CommandResult Shell(const std::string& command, const std::string& connId = "");
     CommandResult TargetBoot(const std::string& mode, const std::string& connId = "");
     CommandResult TargetMount(const std::string& connId = "");
@@ -122,6 +123,9 @@ public:
                 const std::string& connId = "");
     int Reverse(const std::string& remotePort, const std::string& localPort,
                 const std::string& connId = "");
+    CommandResult ForwardList(const std::string& connId = "");
+    int ForwardRemove(const std::string& localPort, const std::string& remotePort,
+                      const std::string& connId = "");
     
     // Logging and debug
     CommandResult Hilog(const std::string& args, const std::string& connId = "");
