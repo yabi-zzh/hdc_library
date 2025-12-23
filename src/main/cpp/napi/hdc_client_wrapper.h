@@ -143,6 +143,10 @@ public:
     
     // Current connection info
     std::string GetCurrentConnectKey() const;
+    
+    // Internal accessors for cleanup functions
+    uv_loop_t* GetLoop() const { return loop_; }
+    bool IsLoopRunning() const { return loopRunning_.load(); }
 
 private:
     HdcClientWrapper();

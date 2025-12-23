@@ -1446,67 +1446,99 @@ int HdcClientWrapper::ConnectInternal(const std::string& host, uint16_t port, in
         ConnectionState* oldState = g_connState;
         g_connState = nullptr;  // Clear global pointer first to prevent callbacks from using it
         
-        // Always try to close the TCP handle if loop exists
-        if (loop_ != nullptr) {
+        // Always try to close the TCP handle if loop exists and is running
+        if (loop_ != nullptr && loopRunning_.load()) {
             // Create close context on heap - will be deleted in close callback
             CloseContext* closeCtx = new CloseContext();
             closeCtx->oldState = oldState;
             closeCtx->shouldDeleteState = true;
             
-            bool needClose = false;
-            bool alreadyClosing = false;
+            // CRITICAL: uv_close must be called from the event loop thread
+            // Use uv_async to schedule the close operation
+            struct CleanupContext {
+                ConnectionState* oldState;
+                CloseContext* closeCtx;
+                uv_loop_t* loop;
+                std::atomic<bool> done{false};
+            };
             
-            // Hold the lock while checking and initiating close to synchronize with RunEventLoop
+            CleanupContext* cleanupCtx = new CleanupContext();
+            cleanupCtx->oldState = oldState;
+            cleanupCtx->closeCtx = closeCtx;
+            cleanupCtx->loop = loop_;
+            
+            uv_async_t* asyncCleanup = new uv_async_t();
+            asyncCleanup->data = cleanupCtx;
+            
+            bool asyncInitSuccess = false;
             {
                 std::lock_guard<std::mutex> lock(g_loopMutex);
                 
-                alreadyClosing = uv_is_closing((uv_handle_t*)&oldState->tcpHandle);
-                
-                if (!alreadyClosing) {
-                    // Stop reading first if connected
-                    if (oldState->connected.load()) {
-                        uv_read_stop((uv_stream_t*)&oldState->tcpHandle);
-                    }
-                    needClose = true;
-                    
-                    // Store close context in handle data
-                    oldState->tcpHandle.data = closeCtx;
-                    
-                    // Close the handle - the callback will clean up asynchronously
-                    uv_close((uv_handle_t*)&oldState->tcpHandle, [](uv_handle_t* handle) {
-                        CloseContext* ctx = static_cast<CloseContext*>(handle->data);
-                        if (ctx) {
-                            ctx->closed = true;
-                            if (ctx->shouldDeleteState && ctx->oldState) {
+                if (loop_ != nullptr) {
+                    int ret = uv_async_init(loop_, asyncCleanup, [](uv_async_t* handle) {
+                        CleanupContext* ctx = static_cast<CleanupContext*>(handle->data);
+                        if (ctx && ctx->oldState) {
+                            bool alreadyClosing = uv_is_closing((uv_handle_t*)&ctx->oldState->tcpHandle);
+                            
+                            if (!alreadyClosing) {
+                                // Stop reading first if connected
+                                if (ctx->oldState->connected.load()) {
+                                    uv_read_stop((uv_stream_t*)&ctx->oldState->tcpHandle);
+                                }
+                                
+                                // Store close context in handle data
+                                ctx->oldState->tcpHandle.data = ctx->closeCtx;
+                                
+                                // Close the handle - the callback will clean up asynchronously
+                                uv_close((uv_handle_t*)&ctx->oldState->tcpHandle, [](uv_handle_t* tcpHandle) {
+                                    CloseContext* closeCtx = static_cast<CloseContext*>(tcpHandle->data);
+                                    if (closeCtx) {
+                                        closeCtx->closed = true;
+                                        if (closeCtx->shouldDeleteState && closeCtx->oldState) {
+                                            delete closeCtx->oldState;
+                                            closeCtx->oldState = nullptr;
+                                        }
+                                        delete closeCtx;
+                                    }
+                                });
+                            } else {
+                                // Handle already closing, just delete the context
+                                delete ctx->closeCtx;
                                 delete ctx->oldState;
-                                ctx->oldState = nullptr;
                             }
-                            delete ctx;
                         }
+                        ctx->done = true;
+                        
+                        // Close the async handle
+                        uv_close((uv_handle_t*)handle, [](uv_handle_t* h) {
+                            uv_async_t* async = (uv_async_t*)h;
+                            CleanupContext* cctx = static_cast<CleanupContext*>(async->data);
+                            delete cctx;
+                            delete async;
+                        });
                     });
+                    
+                    if (ret == 0) {
+                        asyncInitSuccess = true;
+                        uv_async_send(asyncCleanup);
+                    }
                 }
             }
             
-            if (needClose) {
-                // Wait for close to complete
+            if (asyncInitSuccess) {
+                // Wait for cleanup to complete (max 1 second)
                 int closeWaitCount = 0;
-                const int maxCloseWait = 100;  // Max 1 second wait
-                while (!closeCtx->closed.load() && closeWaitCount < maxCloseWait) {
+                const int maxCloseWait = 100;
+                while (!cleanupCtx->done.load() && closeWaitCount < maxCloseWait) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(10));
                     closeWaitCount++;
                 }
             } else {
+                // Async init failed, clean up directly
                 delete closeCtx;
-                
-                // Wait for the handle to finish closing
-                int closeWaitCount = 0;
-                const int maxCloseWait = 100;
-                while (uv_is_closing((uv_handle_t*)&oldState->tcpHandle) && closeWaitCount < maxCloseWait) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-                    closeWaitCount++;
-                }
-                
                 delete oldState;
+                delete cleanupCtx;
+                delete asyncCleanup;
             }
         } else {
             delete oldState;
@@ -1791,43 +1823,110 @@ int HdcClientWrapper::Disconnect(const std::string& connId) {
         ConnectionState* oldState = g_connState;
         g_connState = nullptr;  // Clear global pointer first to prevent callbacks from using it
         
-        if (oldState->connected.load() && loop_ != nullptr) {
+        if (oldState->connected.load() && loop_ != nullptr && loopRunning_.load()) {
             // Create close context on heap - will be deleted in callback
             CloseContext* closeCtx = new CloseContext();
             closeCtx->oldState = oldState;
             closeCtx->shouldDeleteState = true;
             
-            // Hold the lock while operating on libuv handles to synchronize with RunEventLoop
+            // CRITICAL: uv_close must be called from the event loop thread
+            // Use uv_async to schedule the close operation in the event loop thread
+            struct DisconnectContext {
+                ConnectionState* oldState;
+                CloseContext* closeCtx;
+                uv_loop_t* loop;
+                std::atomic<bool> done{false};
+            };
+            
+            DisconnectContext* disconnectCtx = new DisconnectContext();
+            disconnectCtx->oldState = oldState;
+            disconnectCtx->closeCtx = closeCtx;
+            disconnectCtx->loop = loop_;
+            
+            uv_async_t* asyncDisconnect = new uv_async_t();
+            asyncDisconnect->data = disconnectCtx;
+            
             {
                 std::lock_guard<std::mutex> lock(g_loopMutex);
                 
-                // Stop reading first
-                if (!uv_is_closing((uv_handle_t*)&oldState->tcpHandle)) {
-                    uv_read_stop((uv_stream_t*)&oldState->tcpHandle);
-                    
-                    // Store close context in handle data
-                    oldState->tcpHandle.data = closeCtx;
-                    
-                    // Close handle - the callback will clean up asynchronously
-                    uv_close((uv_handle_t*)&oldState->tcpHandle, [](uv_handle_t* handle) {
-                        CloseContext* ctx = static_cast<CloseContext*>(handle->data);
-                        if (ctx) {
-                            ctx->closed = true;
-                            // Delete the old state in the callback
-                            if (ctx->shouldDeleteState && ctx->oldState) {
-                                delete ctx->oldState;
-                                ctx->oldState = nullptr;
-                            }
-                            delete ctx;
-                        }
-                    });
-                } else {
-                    // Handle already closing
+                if (loop_ == nullptr) {
+                    // Loop was destroyed, clean up directly
                     delete closeCtx;
                     delete oldState;
+                    delete disconnectCtx;
+                    delete asyncDisconnect;
+                    currentConnectKey_.clear();
+                    SetLastError(static_cast<int>(ErrorCode::SUCCESS));
+                    return static_cast<int>(ErrorCode::SUCCESS);
                 }
+                
+                int ret = uv_async_init(loop_, asyncDisconnect, [](uv_async_t* handle) {
+                    DisconnectContext* ctx = static_cast<DisconnectContext*>(handle->data);
+                    if (ctx && ctx->oldState) {
+                        // Now we're in the event loop thread, safe to call uv_close
+                        if (!uv_is_closing((uv_handle_t*)&ctx->oldState->tcpHandle)) {
+                            uv_read_stop((uv_stream_t*)&ctx->oldState->tcpHandle);
+                            
+                            // Store close context in handle data
+                            ctx->oldState->tcpHandle.data = ctx->closeCtx;
+                            
+                            // Close handle - the callback will clean up asynchronously
+                            uv_close((uv_handle_t*)&ctx->oldState->tcpHandle, [](uv_handle_t* tcpHandle) {
+                                CloseContext* closeCtx = static_cast<CloseContext*>(tcpHandle->data);
+                                if (closeCtx) {
+                                    closeCtx->closed = true;
+                                    // Delete the old state in the callback
+                                    if (closeCtx->shouldDeleteState && closeCtx->oldState) {
+                                        delete closeCtx->oldState;
+                                        closeCtx->oldState = nullptr;
+                                    }
+                                    delete closeCtx;
+                                }
+                            });
+                        } else {
+                            // Handle already closing
+                            delete ctx->closeCtx;
+                            delete ctx->oldState;
+                        }
+                    }
+                    ctx->done = true;
+                    
+                    // Close the async handle
+                    uv_close((uv_handle_t*)handle, [](uv_handle_t* h) {
+                        uv_async_t* async = (uv_async_t*)h;
+                        DisconnectContext* dctx = static_cast<DisconnectContext*>(async->data);
+                        delete dctx;
+                        delete async;
+                    });
+                });
+                
+                if (ret != 0) {
+                    OH_LOG_ERROR(LOG_APP, "uv_async_init failed in Disconnect: %{public}s", uv_strerror(ret));
+                    delete closeCtx;
+                    delete oldState;
+                    delete disconnectCtx;
+                    delete asyncDisconnect;
+                    currentConnectKey_.clear();
+                    SetLastError(static_cast<int>(ErrorCode::ERR_INTERNAL));
+                    return static_cast<int>(ErrorCode::ERR_INTERNAL);
+                }
+                
+                // Trigger the async callback
+                uv_async_send(asyncDisconnect);
+            }
+            
+            // Wait for disconnect to complete (max 2 seconds)
+            int waitCount = 0;
+            while (!disconnectCtx->done.load() && waitCount < 200) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                waitCount++;
+            }
+            
+            if (!disconnectCtx->done.load()) {
+                OH_LOG_WARN(LOG_APP, "Disconnect: timeout waiting for async close");
             }
         } else {
+            // Not connected or loop not running, just delete the state
             delete oldState;
         }
     }
@@ -2042,31 +2141,161 @@ static void ResetChannelIdCounter() {
     g_channelIdCounter = 1;
 }
 
+// Structure to track pending close operations for forward tasks
+struct ForwardCloseContext {
+    ForwardTask* task;
+    std::atomic<int> pendingCloses{0};
+    std::atomic<bool> allClosed{false};
+};
+
 // Cleanup forward tasks and list (called during disconnect/cleanup)
-// NOTE: This function should NOT call uv_close directly as it may be called from non-event-loop thread
-// The TCP handles will be cleaned up when the connection is closed
+// CRITICAL: Must properly close uv_tcp_t handles before deleting ForwardTask
+// to prevent use-after-free in libuv event loop
+// NOTE: uv_close must be called from the event loop thread
 static void CleanupForwardTasks() {
-    // Cleanup forward tasks - only delete the task structures, not the uv handles
-    // The uv handles are associated with the connection and will be cleaned up separately
+    // Get the loop pointer safely
+    uv_loop_t* loop = HdcClientWrapper::GetInstance().GetLoop();
+    bool loopRunning = HdcClientWrapper::GetInstance().IsLoopRunning();
+    
+    // Collect tasks to cleanup
+    std::vector<ForwardTask*> tasksToCleanup;
     {
         std::lock_guard<std::mutex> lock(g_forwardTasksMutex);
         for (auto& pair : g_forwardTasks) {
-            ForwardTask* task = pair.second;
-            if (task) {
-                // Mark listener as inactive - don't call uv_close here as we may not be in event loop thread
-                task->listenerActive = false;
-                // Cleanup contexts - just delete the structures
-                for (auto& ctxPair : task->contexts) {
-                    if (ctxPair.second) {
-                        ctxPair.second->finished = true;
-                        delete ctxPair.second;
-                    }
-                }
-                task->contexts.clear();
-                delete task;
+            if (pair.second) {
+                tasksToCleanup.push_back(pair.second);
             }
         }
         g_forwardTasks.clear();
+    }
+    
+    if (tasksToCleanup.empty()) {
+        // Cleanup forward list
+        {
+            std::lock_guard<std::mutex> lock(g_forwardListMutex);
+            g_forwardList.clear();
+        }
+        ResetChannelIdCounter();
+        return;
+    }
+    
+    // If loop is not running, just delete everything directly
+    if (loop == nullptr || !loopRunning) {
+        for (auto* task : tasksToCleanup) {
+            for (auto& ctxPair : task->contexts) {
+                delete ctxPair.second;
+            }
+            task->contexts.clear();
+            delete task;
+        }
+        
+        // Cleanup forward list
+        {
+            std::lock_guard<std::mutex> lock(g_forwardListMutex);
+            g_forwardList.clear();
+        }
+        ResetChannelIdCounter();
+        return;
+    }
+    
+    // Use uv_async to close handles in the event loop thread
+    struct ForwardCleanupContext {
+        std::vector<ForwardTask*> tasks;
+        std::atomic<bool> done{false};
+    };
+    
+    ForwardCleanupContext* cleanupCtx = new ForwardCleanupContext();
+    cleanupCtx->tasks = std::move(tasksToCleanup);
+    
+    uv_async_t* asyncCleanup = new uv_async_t();
+    asyncCleanup->data = cleanupCtx;
+    
+    bool asyncInitSuccess = false;
+    {
+        std::lock_guard<std::mutex> loopLock(g_loopMutex);
+        
+        if (loop != nullptr) {
+            int ret = uv_async_init(loop, asyncCleanup, [](uv_async_t* handle) {
+                ForwardCleanupContext* ctx = static_cast<ForwardCleanupContext*>(handle->data);
+                
+                // Now we're in the event loop thread, safe to call uv_close
+                for (auto* task : ctx->tasks) {
+                    // Close context TCP handles
+                    for (auto& ctxPair : task->contexts) {
+                        ForwardContext* fwdCtx = ctxPair.second;
+                        if (fwdCtx) {
+                            fwdCtx->finished = true;
+                            
+                            // Close tcpHandle if initialized and not closing
+                            if (!uv_is_closing((uv_handle_t*)&fwdCtx->tcpHandle)) {
+                                fwdCtx->tcpHandle.data = fwdCtx;
+                                uv_close((uv_handle_t*)&fwdCtx->tcpHandle, [](uv_handle_t* h) {
+                                    ForwardContext* fc = static_cast<ForwardContext*>(h->data);
+                                    delete fc;
+                                });
+                            } else {
+                                delete fwdCtx;
+                            }
+                            
+                            // Note: listenHandle for master contexts is handled by task->listenHandle
+                        }
+                    }
+                    task->contexts.clear();
+                    
+                    // Close task listener handle if active
+                    if (task->listenerActive && !uv_is_closing((uv_handle_t*)&task->listenHandle)) {
+                        task->listenHandle.data = task;
+                        uv_close((uv_handle_t*)&task->listenHandle, [](uv_handle_t* h) {
+                            ForwardTask* t = static_cast<ForwardTask*>(h->data);
+                            delete t;
+                        });
+                    } else {
+                        delete task;
+                    }
+                }
+                ctx->tasks.clear();
+                ctx->done = true;
+                
+                // Close the async handle
+                uv_close((uv_handle_t*)handle, [](uv_handle_t* h) {
+                    uv_async_t* async = (uv_async_t*)h;
+                    ForwardCleanupContext* fctx = static_cast<ForwardCleanupContext*>(async->data);
+                    delete fctx;
+                    delete async;
+                });
+            });
+            
+            if (ret == 0) {
+                asyncInitSuccess = true;
+                uv_async_send(asyncCleanup);
+            }
+        }
+    }
+    
+    if (asyncInitSuccess) {
+        // Wait for cleanup to complete (max 2 seconds)
+        int waitCount = 0;
+        const int maxWait = 200;
+        while (!cleanupCtx->done.load() && waitCount < maxWait) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            waitCount++;
+        }
+        
+        if (waitCount >= maxWait) {
+            OH_LOG_WARN(LOG_APP, "CleanupForwardTasks: timeout waiting for async cleanup");
+        }
+    } else {
+        // Async init failed, clean up directly (risky but better than leaking)
+        OH_LOG_WARN(LOG_APP, "CleanupForwardTasks: async init failed, cleaning up directly");
+        for (auto* task : cleanupCtx->tasks) {
+            for (auto& ctxPair : task->contexts) {
+                delete ctxPair.second;
+            }
+            task->contexts.clear();
+            delete task;
+        }
+        delete cleanupCtx;
+        delete asyncCleanup;
     }
     
     // Cleanup forward list
